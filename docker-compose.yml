@@ -1,0 +1,76 @@
+# VSR Inventory — local development stack.
+#
+#   docker compose up --build
+#
+# Services:
+#   postgres  Postgres 15, data persisted in the `pgdata` volume.
+#   api       Express + TypeScript API (Dockerfile lives in apps/api).
+#   web       Vite + React frontend (Dockerfile lives in apps/web).
+#
+# The api/web Dockerfiles are owned by their respective app builds; this
+# file only wires them together. If you run without Docker instead, see the
+# README ("Local run without Docker").
+#
+# Env vars come from a `.env` file at the repo root (copy .env.example).
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: vsr-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vsr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vsr}
+      POSTGRES_DB: ${POSTGRES_DB:-vsr_inventory}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vsr} -d ${POSTGRES_DB:-vsr_inventory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: vsr-api
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-vsr}:${POSTGRES_PASSWORD:-vsr}@postgres:5432/${POSTGRES_DB:-vsr_inventory}
+      PORT: 4000
+      API_URL: ${API_URL:-http://localhost:5173}
+      OCR_PROVIDER: ${OCR_PROVIDER:-stub}
+    ports:
+      - "4000:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    container_name: vsr-web
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:4000}
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  pgdata:
