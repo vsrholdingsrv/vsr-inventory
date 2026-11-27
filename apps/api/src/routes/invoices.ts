@@ -180,6 +180,10 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
     );
     res.status(201).json({ ...draft, lines });
   } catch (err) {
+    if (err instanceof z.ZodError) {
+      res.status(400).json({ error: 'Invalid manual invoice', details: err.issues });
+      return;
+    }
     next(err);
   }
 });
