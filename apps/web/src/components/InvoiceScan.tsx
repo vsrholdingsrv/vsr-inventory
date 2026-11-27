@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { createWorker } from 'tesseract.js';
+import { createWorker, PSM } from 'tesseract.js';
 import {
+  createManualInvoice,
   getSampleInvoice,
   postInvoiceDraft,
   scanInvoice,
@@ -15,6 +16,42 @@ export default function InvoiceScan() {
   const [busy, setBusy] = useState(false);
   const [ocrStatus, setOcrStatus] = useState<string | null>(null);
   const [ocrText, setOcrText] = useState<string | null>(null);
+  const [showManual, setShowManual] = useState(false);
+  const [manualSupplier, setManualSupplier] = useState('');
+  const [manualInvoiceNo, setManualInvoiceNo] = useState('');
+  const [manualLines, setManualLines] = useState<
+    { name: string; qty: string; cost: string }[]
+  >([{ name: '', qty: '', cost: '' }]);
+
+  async function handleManual() {
+    const lines = manualLines
+      .filter((l) => l.name.trim() && Number(l.qty) > 0)
+      .map((l) => ({
+        name: l.name.trim(),
+        qty: Number(l.qty),
+        unitCostCents: Math.round(Number(l.cost || 0) * 100),
+      }));
+    if (!manualSupplier.trim()) {
+      setError('Enter the supplier name for the manual invoice.');
+      return;
+    }
+    if (lines.length === 0) {
+      setError('Enter at least one line with a product name and a quantity.');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      setDraft(await createManualInvoice(manualSupplier.trim(), manualInvoiceNo.trim(), lines));
+      setMessage('Manual draft created — review each line before posting.');
+      setShowManual(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not create the manual draft.');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   /**
    * Read the photo with Tesseract.js ON THE PHONE, then send the *text* to
@@ -41,6 +78,10 @@ export default function InvoiceScan() {
           }
         },
       });
+      // PSM 6: one uniform block of text — reads dense invoice tables far
+      // better than the default auto page segmentation (PSM 3), which
+      // scrambles table rows and is why clean photos came back unreadable.
+      await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
       const { data } = await worker.recognize(file);
       const text = data.text ?? '';
       setOcrText(text);
@@ -113,7 +154,9 @@ export default function InvoiceScan() {
         <p className="muted">
           Photograph or upload a supplier invoice. The photo is read on your
           phone and the lines become a draft — nothing posts until you review
-          and confirm each line.
+          and confirm each line. For the best read, lay the invoice flat, fill
+          the frame with it, and use good light — a folded or angled photo
+          misreads quantities and prices.
         </p>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <label className="primary" style={{ cursor: 'pointer', padding: '9px 14px', borderRadius: 6 }}>
@@ -146,7 +189,86 @@ export default function InvoiceScan() {
           <button className="secondary" onClick={() => void handleSample()} disabled={busy}>
             Load sample invoice
           </button>
+          <button className="secondary" onClick={() => setShowManual((v) => !v)} disabled={busy}>
+            {showManual ? 'Hide manual entry' : 'Enter lines manually'}
+          </button>
         </div>
+        {showManual && (
+          <div style={{ marginTop: 12, borderTop: '1px solid #ddd', paddingTop: 12 }}>
+            <p className="muted">
+              Use this when the photo cannot be read. Type the lines from the
+              invoice — they become a draft, same as a scan, and nothing posts
+              until you confirm each line.
+            </p>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+              <input
+                type="text"
+                placeholder="Supplier, e.g. Red Bull Distribution"
+                value={manualSupplier}
+                onChange={(e) => setManualSupplier(e.target.value)}
+                style={{ flex: '1 1 220px' }}
+              />
+              <input
+                type="text"
+                placeholder="Invoice # (optional)"
+                value={manualInvoiceNo}
+                onChange={(e) => setManualInvoiceNo(e.target.value)}
+                style={{ flex: '1 1 140px' }}
+              />
+            </div>
+            {manualLines.map((l, idx) => (
+              <div key={idx} style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
+                <input
+                  type="text"
+                  placeholder="Product name"
+                  value={l.name}
+                  onChange={(e) =>
+                    setManualLines((rows) =>
+                      rows.map((r, i) => (i === idx ? { ...r, name: e.target.value } : r)),
+                    )
+                  }
+                  style={{ flex: '2 1 160px' }}
+                />
+                <input
+                  type="number"
+                  min={0}
+                  placeholder="Qty (units)"
+                  value={l.qty}
+                  onChange={(e) =>
+                    setManualLines((rows) =>
+                      rows.map((r, i) => (i === idx ? { ...r, qty: e.target.value } : r)),
+                    )
+                  }
+                  style={{ width: 90 }}
+                />
+                <input
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  placeholder="Cost / unit $"
+                  value={l.cost}
+                  onChange={(e) =>
+                    setManualLines((rows) =>
+                      rows.map((r, i) => (i === idx ? { ...r, cost: e.target.value } : r)),
+                    )
+                  }
+                  style={{ width: 110 }}
+                />
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                className="secondary"
+                onClick={() => setManualLines((rows) => [...rows, { name: '', qty: '', cost: '' }])}
+              >
+                + Add line
+              </button>
+              <button className="primary" onClick={() => void handleManual()} disabled={busy}>
+                Create draft from these lines
+              </button>
+            </div>
+          </div>
+        )}
         {busy && ocrStatus && <p className="muted">{ocrStatus}</p>}
         {error && <p className="error">{error}</p>}
         {message && <p>{message}</p>}

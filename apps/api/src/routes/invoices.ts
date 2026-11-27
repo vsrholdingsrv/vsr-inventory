@@ -110,6 +110,80 @@ export function invoicesRouter(pool: Pool): Router {
     }
   });
 
+const manualSchema = z.object({
+  storeId: z.string().uuid(),
+  supplier: z.string().min(1).max(120),
+  invoiceNumber: z.string().max(60).optional().default(''),
+  lines: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(120),
+        barcode: z.string().regex(/^\d{12}$/).optional(),
+        qty: z.number().int().min(1),
+        unitCostCents: z.number().int().min(0),
+      }),
+    )
+    .min(1)
+    .max(100),
+});
+
+/**
+ * POST /api/invoices/manual — type the invoice lines in by hand when OCR
+ * cannot read a photo. Same draft-only flow as a scan: nothing posts until
+ * lines are confirmed via POST /invoices/:id/confirm.
+ */
+router.post('/manual', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const body = manualSchema.parse(req.body);
+    const store = await pool.query(`SELECT id FROM stores WHERE id = $1`, [body.storeId]);
+    if (store.rows.length === 0) {
+      res.status(404).json({ error: 'Store not found' });
+      return;
+    }
+    const { rows: catalog } = await pool.query(
+      `SELECT id, name, barcode, cost_cents FROM products`,
+    );
+    const matched = matchInvoiceLines(body.lines, catalog);
+    const draft = await withTransaction(async (client) => {
+      const { rows: scans } = await client.query(
+        `INSERT INTO invoice_scans (store_id, supplier, invoice_number, status, raw)
+         VALUES ($1, $2, $3, 'draft', $4) RETURNING id`,
+        [
+          body.storeId,
+          body.supplier,
+          body.invoiceNumber,
+          JSON.stringify({ supplier: body.supplier, invoiceNumber: body.invoiceNumber, lines: body.lines, source: 'manual' }),
+        ],
+      );
+      const scanId: string = scans[0].id;
+      const draftShape = createDraft({
+        id: scanId,
+        storeId: body.storeId,
+        supplier: body.supplier,
+        invoiceNumber: body.invoiceNumber,
+        lines: matched,
+      });
+      for (const line of matched) {
+        await client.query(
+          `INSERT INTO invoice_lines
+             (invoice_scan_id, product_id, name, barcode, qty, unit_cost_cents, status, confirmed)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`,
+          [scanId, line.productId, line.name, line.barcode ?? null, line.qty, line.unitCostCents, line.status],
+        );
+      }
+      return draftShape;
+    });
+    const { rows: lines } = await pool.query(
+      `SELECT id, product_id, name, barcode, qty, unit_cost_cents, status, confirmed
+         FROM invoice_lines WHERE invoice_scan_id = $1 ORDER BY created_at`,
+      [draft.id],
+    );
+    res.status(201).json({ ...draft, lines });
+  } catch (err) {
+    next(err);
+  }
+});
+
   // GET /api/invoices/:id — draft with its lines.
   router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     try {

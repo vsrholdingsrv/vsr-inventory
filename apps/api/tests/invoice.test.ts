@@ -165,3 +165,43 @@ describe('parseOcrText — real Red Bull invoice (0.1.5)', () => {
     expect(() => parseOcrText('Hello world\nnothing here')).toThrow(/No invoice lines/);
   });
 });
+
+describe('parseOcrText — messy OCR (0.1.6)', () => {
+  it('handles rows split across two lines (description line, then money line)', () => {
+    const inv = parseOcrText(
+      [
+        'Red Bull Distribution Company Inc.',
+        'Invoice: 2039427858',
+        'RB1718 2 48 RED BULL 8.4OZ LS',
+        '45.99 2.40 8.00 0.00 80.78',
+        '611269991000',
+        'RB4817 2 48 SUGARFREE 12OZ LS',
+        '58.71 2.40 8.00 0.00 106.22',
+        '611269716467',
+      ].join('\n'),
+    );
+    expect(inv.lines).toHaveLength(2);
+    expect(inv.lines[0].qty).toBe(48);
+    expect(inv.lines[0].unitCostCents).toBe(168);
+    expect(inv.lines[0].barcode).toBe('611269991000');
+    expect(inv.lines[1].unitCostCents).toBe(221);
+  });
+
+  it('handles a garbled/missing item code and stray $ signs', () => {
+    const inv = parseOcrText(
+      [
+        'Core-Mark',
+        'Invoice: CM-999',
+        '2 48 RED BULL 8.4OZ LS $45.99 $2.40 $8.00 $0.00 $80.78',
+        '1 24 W PEACH 12OZ $58.71 $2.40 $8.00 $0.00 $53.11',
+      ].join('\n'),
+    );
+    expect(inv.lines).toHaveLength(2);
+    expect(inv.lines.map((l) => l.qty)).toEqual([48, 24]);
+    expect(inv.lines.map((l) => l.unitCostCents)).toEqual([168, 221]);
+  });
+
+  it('still throws on text with no readable rows', () => {
+    expect(() => parseOcrText('Red Bull Distribution\nInvoice 123\nThank you')).toThrow(/No invoice lines/);
+  });
+});

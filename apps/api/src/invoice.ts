@@ -95,42 +95,88 @@ export function parseOcrText(text: string): ExtractedInvoice {
   const SKIP = /^(totals?|discount|invoice|deposit|tax|total due|units picked|number of sku|cases delivered|units delivered|id\s+qty|route:|load sheet|salesman:|cust#|terms:|po#|for billing|your signature|printed signature)/i;
 
   const lines: InvoiceLineInput[] = [];
-  for (let i = 0; i < rawLines.length; i++) {
-    const line = rawLines[i];
+  // Tesseract often splits one table row across two text lines
+  // ("RB1718 2 48 RED BULL 8.4OZ LS" / "45.99 2.40 8.00 0.00 80.78"), so
+  // accumulate lines into a buffer and flush it as one logical row when a
+  // money value appears. Headers and bare barcodes flush on their own.
+  const logical: string[] = [];
+  let buf = '';
+  const flush = () => {
+    if (buf.trim()) logical.push(buf.trim());
+    buf = '';
+  };
+  for (const line of rawLines) {
+    if (/^\d{12}$/.test(line)) {
+      flush();
+      logical.push(line);
+      continue;
+    }
+    if (SKIP.test(line) || /invoice/i.test(line) || /distribution|company/i.test(line)) {
+      flush();
+      logical.push(line);
+      continue;
+    }
+    buf = buf ? `${buf} ${line}` : line;
+    if (/\d+\.\d{2}/.test(line)) flush();
+  }
+  flush();
+
+  for (let i = 0; i < logical.length; i++) {
+    const line = logical[i];
     if (SKIP.test(line)) continue;
+    // Totals/summary block: these phrases never appear in a real item row,
+    // wherever they sit in a merged line — drop the whole line.
+    if (/number of sku|units picked|units delivered|cases delivered|total due|check:|c\. applied|roa:/i.test(line)) continue;
     // A bare 12-digit line is a barcode for the previous item, not a line.
     if (/^\d{12}$/.test(line)) continue;
 
-    const m = line.match(
-      /^([A-Za-z]{1,3}\d{3,})\s+(\d+)\s+(\d+)\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$/,
+    // Tolerant row parse: last money value is the line total, the first two
+    // integers are cases + UNITS (stock moves in units), and everything
+    // between them and the money tail is the description. The item code is
+    // optional — OCR often drops or garbles it.
+    //
+    // Sanity guards (a folded/angled photo misreads digits badly, e.g. 48
+    // as "4s" and $58.71 as $68.71): a row is only trusted if it has at
+    // least 2 money values, no integer longer than 4 digits in the head
+    // (a barcode fragment leaking into the quantity), qty 1–999, and a
+    // unit cost between $0.05 and $200. Rows failing these are dropped —
+    // a wrong draft line is worse than no draft line, and the draft is
+    // review-only either way.
+    const moneys = [...line.matchAll(/(\d{1,3}(?:,\d{3})*\.\d{2})/g)].map((m) =>
+      Number(m[1].replace(/,/g, '')),
     );
-    if (m) {
-      const units = Number(m[3]);
-      const total = Number(m[9].replace(/,/g, ''));
-      if (units <= 0 || !Number.isFinite(total)) continue;
-      const barcode =
-        /^\d{12}$/.test(rawLines[i + 1] ?? '') ? rawLines[i + 1] : undefined;
-      lines.push({
-        name: cleanDescription(m[4]),
-        barcode,
-        qty: units,
-        unitCostCents: Math.round((total * 100) / units),
-      });
-      continue;
-    }
-    // Generic fallback: "DESCRIPTION  qty  $total" — total is the last number.
-    const g = line.match(/^([A-Za-z][A-Za-z0-9 .&/-]{2,})\s+(\d+)\s+\$?([\d,]+\.\d{2})\s*$/);
-    if (g && !/^\d+$/.test(g[1])) {
-      const qty = Number(g[2]);
-      const total = Number(g[3].replace(/,/g, ''));
-      if (qty > 0 && Number.isFinite(total)) {
-        lines.push({
-          name: cleanDescription(g[1]),
-          qty,
-          unitCostCents: Math.round((total * 100) / qty),
-        });
-      }
-    }
+    if (moneys.length < 2) continue;
+    const total = moneys[moneys.length - 1];
+    // Head = everything before the first money value.
+    const firstMoneyIdx = line.search(/\d{1,3}(?:,\d{3})*\.\d{2}/);
+    const head = line.slice(0, firstMoneyIdx).trim();
+    const intTokens = [...head.matchAll(/\b(\d+)\b/g)].map((m) => m[1]);
+    if (intTokens.some((t) => t.length > 4)) continue;
+    const ints = intTokens.map(Number);
+    if (ints.length === 0 || !Number.isFinite(total) || total <= 0) continue;
+    const qty = ints.length >= 2 ? ints[1] : ints[0];
+    if (qty < 1 || qty > 999) continue;
+    const unitCostCents = Math.round((total * 100) / qty);
+    if (unitCostCents < 5 || unitCostCents > 20000) continue;
+    // Description: head minus a leading item code and the two qty integers.
+    let desc = head
+      .replace(/^[A-Za-z]{1,4}[\d-]{2,}\s+/, '')
+      .replace(/\b\d+\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    desc = cleanDescription(desc);
+    if (!/[A-Za-z]{3,}/.test(desc)) continue;
+    // Barcode: a 12-digit token in this line, or the bare line after it.
+    const inLineBarcode = line.match(/\b(\d{12})\b/);
+    const barcode =
+      inLineBarcode?.[1] ??
+      (/^\d{12}$/.test(logical[i + 1] ?? '') ? logical[i + 1] : undefined);
+    lines.push({
+      name: desc,
+      barcode,
+      qty,
+      unitCostCents,
+    });
   }
 
   if (lines.length === 0) {

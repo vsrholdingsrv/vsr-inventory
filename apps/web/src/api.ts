@@ -537,6 +537,21 @@ export async function scanInvoice(
   return mapInvoiceDraft(row);
 }
 
+/** Type invoice lines in by hand (fallback when OCR cannot read a photo). */
+export async function createManualInvoice(
+  supplier: string,
+  invoiceNumber: string,
+  lines: { name: string; barcode?: string; qty: number; unitCostCents: number }[],
+  storeId?: string,
+): Promise<InvoiceDraft> {
+  const sid = await defaultStoreId(storeId);
+  const row = await request<InvoiceDraftRow>('/api/invoices/manual', {
+    method: 'POST',
+    body: JSON.stringify({ storeId: sid, supplier, invoiceNumber, lines }),
+  });
+  return mapInvoiceDraft(row);
+}
+
 /** A ready-made sample invoice, for demoing the review flow without a photo. */
 export async function getSampleInvoice(storeId?: string): Promise<InvoiceDraft> {
   const q = storeId ? `?storeId=${encodeURIComponent(storeId)}` : '';
