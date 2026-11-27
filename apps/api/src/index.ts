@@ -2,6 +2,8 @@ import 'dotenv/config';
 import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import { pool, requireDatabaseUrl } from './db';
+import { migrateDatabase } from './db/migrate';
+import { seedIfEmpty } from './seed';
 import { productsRouter } from './routes/products';
 import { storesRouter } from './routes/stores';
 import { movementsRouter } from './routes/movements';
@@ -41,8 +43,25 @@ const PORT = Number(process.env.PORT ?? 3000);
 
 if (require.main === module) {
   requireDatabaseUrl();
-  app.listen(PORT, () => {
-    // eslint-disable-next-line no-console
-    console.log(`[api] vsr-inventory-api listening on :${PORT} (commander: simulated)`);
-  });
+  (async () => {
+    // Self-setup for fresh databases (e.g. Render Free, no shell):
+    // create the tables, then seed the demo catalog only if empty.
+    // Set AUTO_SETUP=false to skip this. Failures are logged, not fatal —
+    // /health must still answer so a bad DB never takes the service down.
+    if (process.env.AUTO_SETUP !== 'false') {
+      try {
+        await migrateDatabase(pool);
+        const seeded = await seedIfEmpty(pool);
+        // eslint-disable-next-line no-console
+        console.log(`[api] startup setup done (seeded demo data: ${seeded})`);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[api] startup setup failed (continuing)', err);
+      }
+    }
+    app.listen(PORT, () => {
+      // eslint-disable-next-line no-console
+      console.log(`[api] vsr-inventory-api listening on :${PORT} (commander: simulated)`);
+    });
+  })();
 }

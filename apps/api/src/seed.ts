@@ -11,7 +11,23 @@
 import 'dotenv/config';
 import { Pool } from 'pg';
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+function createPool(): Pool {
+  return new Pool({ connectionString: process.env.DATABASE_URL });
+}
+
+/**
+ * Seed only when the database is empty (no stores yet). Returns true
+ * when it seeded, false when data was already there. Safe to call on
+ * every API startup — it never overwrites existing data.
+ */
+export async function seedIfEmpty(pool: Pool): Promise<boolean> {
+  const { rows } = await pool.query<{ n: string }>(
+    'SELECT COUNT(*)::INTEGER AS n FROM stores',
+  );
+  if (Number(rows[0]?.n ?? 0) > 0) return false;
+  await main();
+  return true;
+}
 
 interface SeedProduct {
   barcode: string;
@@ -56,6 +72,7 @@ const STORES = [
 const DEFAULT_MARGIN_PCT = 30;
 
 async function main(): Promise<void> {
+  const pool = createPool();
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -150,8 +167,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('[seed] failed', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[seed] failed', err);
+    process.exit(1);
+  });
+}
