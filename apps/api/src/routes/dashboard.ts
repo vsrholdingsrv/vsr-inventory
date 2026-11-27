@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
+import { resolveStoreId } from '../db';
 
 /**
  * GET /api/dashboard/summary — one call for the dashboard home screen.
@@ -11,15 +12,24 @@ export function dashboardRouter(pool: Pool): Router {
 
   router.get('/summary', async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const storeId = typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      const rawStoreId =
+        typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      // A store code (STORE-001) is accepted, not just a UUID; an unknown
+      // store is a 404, and a raw non-UUID value never reaches Postgres
+      // (it would 500 with 22P02 on `store_id = $1`).
+      const storeId = rawStoreId ? await resolveStoreId(pool, rawStoreId) : null;
+      if (rawStoreId && !storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
 
-      const storeFilter = storeId ? 'WHERE store_id = $1' : '';
+      const storeFilter = storeId ? 'WHERE store_id = $1::uuid' : '';
       const params = storeId ? [storeId] : [];
 
       const [{ rows: totals }] = await Promise.all([
         pool.query(
           `SELECT
-             COUNT(DISTINCT store_id)::INTEGER AS stores,
+             ${storeId ? '1' : '(SELECT COUNT(*) FROM stores)'}::INTEGER AS stores,
              COUNT(*)::INTEGER AS stocked_products,
              COALESCE(SUM(on_hand), 0)::INTEGER AS total_units,
              COALESCE(SUM(on_hand * cost_cents), 0)::INTEGER AS inventory_value_cost_cents,
@@ -35,7 +45,7 @@ export function dashboardRouter(pool: Pool): Router {
         `SELECT m.id, m.store_id, m.product_id, p.name AS product_name, p.barcode,
                 m.type, m.qty_delta, m.cost_cents, m.note, m.created_at
            FROM movements m JOIN products p ON p.id = m.product_id
-          ${storeId ? 'WHERE m.store_id = $1' : ''}
+          ${storeId ? 'WHERE m.store_id = $1::uuid' : ''}
           ORDER BY m.created_at DESC LIMIT 10`,
         params,
       );
@@ -50,7 +60,7 @@ export function dashboardRouter(pool: Pool): Router {
       const { rows: lowStock } = await pool.query(
         `SELECT store_id, product_id, barcode, name, on_hand, par_qty
            FROM store_inventory
-          ${storeId ? 'WHERE store_id = $1 AND' : 'WHERE'} on_hand < par_qty AND par_qty > 0
+          ${storeId ? 'WHERE store_id = $1::uuid AND' : 'WHERE'} on_hand < par_qty AND par_qty > 0
           ORDER BY (par_qty - on_hand) DESC LIMIT 20`,
         params,
       );

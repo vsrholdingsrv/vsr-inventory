@@ -9,7 +9,7 @@ import {
   ocrProviderFromEnv,
   SampleInvoiceProvider,
 } from '../invoice';
-import { resolveStoreId, withTransaction } from '../db';
+import { isUuid, resolveStoreId, withTransaction } from '../db';
 
 const scanSchema = z.object({
   storeId: z.string().uuid(),
@@ -27,11 +27,17 @@ export function invoicesRouter(pool: Pool): Router {
   // GET /api/invoices?storeId= — list invoice scans (drafts included).
   router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const storeId = typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      const rawStoreId =
+        typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      const storeId = rawStoreId ? await resolveStoreId(pool, rawStoreId) : null;
+      if (rawStoreId && !storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
       const { rows } = await pool.query(
         storeId
           ? `SELECT id, store_id, supplier, invoice_number, status, created_at, updated_at
-               FROM invoice_scans WHERE store_id = $1 ORDER BY created_at DESC`
+               FROM invoice_scans WHERE store_id = $1::uuid ORDER BY created_at DESC`
           : `SELECT id, store_id, supplier, invoice_number, status, created_at, updated_at
                FROM invoice_scans ORDER BY created_at DESC`,
         storeId ? [storeId] : [],
@@ -105,9 +111,13 @@ export function invoicesRouter(pool: Pool): Router {
   // GET /api/invoices/:id — draft with its lines.
   router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     try {
+      if (!isUuid(req.params.id)) {
+        res.status(404).json({ error: 'Invoice not found' });
+        return;
+      }
       const { rows: scans } = await pool.query(
         `SELECT id, store_id, supplier, invoice_number, status, created_at, updated_at
-           FROM invoice_scans WHERE id = $1`,
+           FROM invoice_scans WHERE id = $1::uuid`,
         [req.params.id],
       );
       if (scans.length === 0) {
@@ -206,6 +216,72 @@ export function invoicesRouter(pool: Pool): Router {
     }
   });
 
+const updateLineSchema = z.object({
+  qty: z.number().int().min(1).optional(),
+  unitCostCents: z.number().int().min(0).optional(),
+});
+
+/**
+ * PATCH /api/invoices/:id/lines/:lineId — correct a draft line's qty/cost
+ * before confirming. The UI lets the user edit qty/cost in the draft
+ * table; without this endpoint those edits were silently ignored and the
+ * original OCR values were posted. Only unconfirmed lines of a draft can
+ * be edited.
+ */
+router.patch('/:id/lines/:lineId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (!isUuid(req.params.id) || !isUuid(req.params.lineId)) {
+      res.status(404).json({ error: 'Invoice line not found' });
+      return;
+    }
+    const body = updateLineSchema.parse(req.body);
+    if (body.qty === undefined && body.unitCostCents === undefined) {
+      res.status(400).json({ error: 'Nothing to update' });
+      return;
+    }
+    const result = await withTransaction(async (client) => {
+      const { rows: scans } = await client.query(
+        `SELECT id, status FROM invoice_scans WHERE id = $1::uuid FOR UPDATE`,
+        [req.params.id],
+      );
+      if (scans.length === 0) return { status: 404 as const, body: { error: 'Invoice not found' } };
+      if (scans[0].status !== 'draft') {
+        return { status: 400 as const, body: { error: `Invoice is ${scans[0].status}, not a draft` } };
+      }
+      const sets: string[] = [];
+      const params: unknown[] = [];
+      if (body.qty !== undefined) {
+        params.push(body.qty);
+        sets.push(`qty = $${params.length}`);
+      }
+      if (body.unitCostCents !== undefined) {
+        params.push(body.unitCostCents);
+        sets.push(`unit_cost_cents = $${params.length}`);
+      }
+      params.push(req.params.id, req.params.lineId);
+      const { rows } = await client.query(
+        `UPDATE invoice_lines SET ${sets.join(', ')}
+          WHERE invoice_scan_id = $${params.length - 1}::uuid
+            AND id = $${params.length}::uuid
+            AND confirmed = FALSE
+          RETURNING id, product_id, name, barcode, qty, unit_cost_cents, status, confirmed`,
+        params,
+      );
+      if (rows.length === 0) {
+        return { status: 404 as const, body: { error: 'Invoice line not found or already confirmed' } };
+      }
+      return { status: 200 as const, body: rows[0] };
+    });
+    res.status(result.status).json(result.body);
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      res.status(400).json({ error: 'Invalid line update', details: err.issues });
+      return;
+    }
+    next(err);
+  }
+});
+
   /**
    * POST /api/invoices/:id/confirm — confirm lines; only confirmed + matched
    * lines post 'receive' movements. Unmatched lines cannot be confirmed;
@@ -213,6 +289,10 @@ export function invoicesRouter(pool: Pool): Router {
    */
   router.post('/:id/confirm', async (req: Request, res: Response, next: NextFunction) => {
     try {
+      if (!isUuid(req.params.id)) {
+        res.status(404).json({ error: 'Invoice not found' });
+        return;
+      }
       const body = confirmSchema.parse(req.body);
 
       const result = await withTransaction(async (client) => {

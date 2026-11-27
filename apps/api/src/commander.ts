@@ -200,6 +200,11 @@ export function ingestVerifoneTransaction(
 
   const postedLines: PostedLine[] = [];
   const unmatchedLines: UnmatchedLine[] = [];
+  // Remaining stock per UPC within THIS transaction. Two lines for the
+  // same UPC must share the on-hand pool: checking each line against the
+  // starting on-hand would let 5 + 5 sell against 8 on hand and drive
+  // stock negative. Decrement as lines post.
+  const remaining = new Map(ctx.onHandByUpc);
 
   for (const line of tx.lines) {
     if (!Number.isInteger(line.qty) || line.qty <= 0) {
@@ -210,7 +215,7 @@ export function ingestVerifoneTransaction(
       });
       continue;
     }
-    const onHand = ctx.onHandByUpc.get(line.upc);
+    const onHand = remaining.get(line.upc);
     if (onHand === undefined) {
       unmatchedLines.push({
         line,
@@ -227,6 +232,7 @@ export function ingestVerifoneTransaction(
       });
       continue;
     }
+    remaining.set(line.upc, onHand - line.qty);
     postedLines.push({ upc: line.upc, qty: line.qty, movementType: 'sale' });
   }
 

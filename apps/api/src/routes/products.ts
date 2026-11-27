@@ -1,7 +1,12 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { z } from 'zod';
-import { resolveStoreId, withTransaction } from '../db';
+import {
+  isPgUniqueViolation,
+  isUuid,
+  resolveStoreId,
+  withTransaction,
+} from '../db';
 
 const createProductSchema = z.object({
   barcode: z.string().min(1),
@@ -17,13 +22,21 @@ export function productsRouter(pool: Pool): Router {
   // GET /api/products — catalog with per-store on-hand when ?storeId= given.
   router.get('/', async (req: Request, res: Response, next: NextFunction) => {
     try {
-      const storeId = typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      const rawStoreId =
+        typeof req.query.storeId === 'string' ? req.query.storeId : null;
+      // A store code (STORE-001) is accepted here, not just a UUID id;
+      // anything else that resolves to no store is a 404, never a 500.
+      const storeId = rawStoreId ? await resolveStoreId(pool, rawStoreId) : null;
+      if (rawStoreId && !storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
       if (storeId) {
         const { rows } = await pool.query(
           `SELECT product_id AS id, barcode, name, category, cost_cents,
                   price_cents, margin_pct, par_qty, on_hand
              FROM store_inventory
-            WHERE store_id = $1
+            WHERE store_id = $1::uuid
             ORDER BY name`,
           [storeId],
         );
@@ -43,12 +56,18 @@ export function productsRouter(pool: Pool): Router {
   // GET /api/products/:id — one product + on-hand across all stores.
   router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     try {
+      // A malformed id is "not found", not a 500: Postgres rejects a
+      // non-UUID string in `p.id = $1` with 22P02.
+      if (!isUuid(req.params.id)) {
+        res.status(404).json({ error: 'Product not found' });
+        return;
+      }
       const { rows } = await pool.query(
         `SELECT p.id, p.barcode, p.name, p.category, p.cost_cents, p.price_cents,
                 COALESCE(SUM(oh.on_hand), 0)::INTEGER AS on_hand_total
            FROM products p
            LEFT JOIN store_product_on_hand oh ON oh.product_id = p.id
-          WHERE p.id = $1
+          WHERE p.id = $1::uuid
           GROUP BY p.id`,
         [req.params.id],
       );
@@ -75,6 +94,10 @@ export function productsRouter(pool: Pool): Router {
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: 'Invalid product', details: err.issues });
+        return;
+      }
+      if (isPgUniqueViolation(err)) {
+        res.status(409).json({ error: `Barcode ${req.body?.barcode} already exists` });
         return;
       }
       next(err);

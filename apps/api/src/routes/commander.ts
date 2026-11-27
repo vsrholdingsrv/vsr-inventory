@@ -7,7 +7,7 @@ import {
   ingestVerifoneTransaction,
   SimulatedCommanderConnector,
 } from '../commander';
-import { withTransaction } from '../db';
+import { isPgForeignKeyViolation, withTransaction } from '../db';
 
 const transactionSchema = z.object({
   transactionId: z.string().min(1),
@@ -54,6 +54,16 @@ export function commanderRouter(pool: Pool): Router {
   router.post('/price-book/import', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = importSchema.parse(req.body);
+      if (body.storeId) {
+        const { rows: stores } = await pool.query(
+          `SELECT id FROM stores WHERE id = $1::uuid`,
+          [body.storeId],
+        );
+        if (stores.length === 0) {
+          res.status(404).json({ error: 'Store not found' });
+          return;
+        }
+      }
       const items = await connector.pullPriceBook();
       const { rows: catalog } = await pool.query(
         `SELECT barcode FROM products`,
@@ -142,6 +152,15 @@ export function commanderRouter(pool: Pool): Router {
       };
 
       const result = await withTransaction(async (client) => {
+        // Unknown store: the pos_transactions INSERT would fail on the
+        // foreign key and surface as a 500.
+        const { rows: stores } = await client.query(
+          `SELECT id FROM stores WHERE id = $1::uuid`,
+          [tx.storeId],
+        );
+        if (stores.length === 0) {
+          throw Object.assign(new Error('Store not found'), { status: 404 });
+        }
         // De-dupe first: the UNIQUE constraint is the backstop, the
         // ON CONFLICT ... DO NOTHING keeps the replay a no-op, not an error.
         const { rows: inserted } = await client.query(
@@ -244,6 +263,14 @@ export function commanderRouter(pool: Pool): Router {
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: 'Invalid transaction', details: err.issues });
+        return;
+      }
+      if (err instanceof Error && (err as { status?: unknown }).status === 404) {
+        res.status(404).json({ error: err.message });
+        return;
+      }
+      if (isPgForeignKeyViolation(err)) {
+        res.status(404).json({ error: 'Store or product not found' });
         return;
       }
       next(err);

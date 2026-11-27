@@ -8,7 +8,7 @@ import {
   recordCount,
   validateMovement,
 } from '../ledger';
-import { getOnHand, withTransaction } from '../db';
+import { getOnHand, isPgForeignKeyViolation, isUuid, withTransaction } from '../db';
 
 const MOVEMENT_TYPES: MovementType[] = [
   'receive',
@@ -30,7 +30,7 @@ const createMovementSchema = z.object({
    * Unsigned qty for receive/return/outgoing types; signed variance
    * (counted - expected) for count-correction.
    */
-  qty: z.number().int(),
+  qty: z.number().int().refine((q) => q !== 0, 'qty must not be zero'),
   costCents: z.number().int().min(0).optional(),
   note: z.string().optional(),
 });
@@ -56,13 +56,23 @@ export function movementsRouter(pool: Pool): Router {
       );
       const conditions: string[] = [];
       const params: unknown[] = [];
+      // Malformed UUIDs are a 400 here: Postgres would 500 (22P02) on
+      // `store_id = $1` with a non-UUID string.
       if (typeof req.query.storeId === 'string') {
+        if (!isUuid(req.query.storeId)) {
+          res.status(400).json({ error: 'Invalid storeId' });
+          return;
+        }
         params.push(req.query.storeId);
-        conditions.push(`store_id = $${params.length}`);
+        conditions.push(`store_id = $${params.length}::uuid`);
       }
       if (typeof req.query.productId === 'string') {
+        if (!isUuid(req.query.productId)) {
+          res.status(400).json({ error: 'Invalid productId' });
+          return;
+        }
         params.push(req.query.productId);
-        conditions.push(`product_id = $${params.length}`);
+        conditions.push(`product_id = $${params.length}::uuid`);
       }
       params.push(limit);
       const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -92,6 +102,19 @@ export function movementsRouter(pool: Pool): Router {
       });
 
       const result = await withTransaction(async (client) => {
+        // Referenced store/product must exist: otherwise the INSERT fails
+        // on the foreign key and surfaces as a 500.
+        const { rows: refs } = await client.query(
+          `SELECT (SELECT COUNT(*) FROM stores WHERE id = $1::uuid) AS stores,
+                  (SELECT COUNT(*) FROM products WHERE id = $2::uuid) AS products`,
+          [body.storeId, body.productId],
+        );
+        if (Number(refs[0]?.stores ?? 0) === 0) {
+          throw Object.assign(new Error('Store not found'), { status: 404 });
+        }
+        if (Number(refs[0]?.products ?? 0) === 0) {
+          throw Object.assign(new Error('Product not found'), { status: 404 });
+        }
         const onHand = await getOnHand(client, body.storeId, body.productId);
         const newOnHand = validateMovement(movement, onHand); // throws InsufficientStockError
         const { rows } = await client.query(
@@ -119,7 +142,15 @@ export function movementsRouter(pool: Pool): Router {
         res.status(409).json({ error: err.message, onHand: err.onHand });
         return;
       }
+      if (err instanceof Error && (err as { status?: unknown }).status === 404) {
+        res.status(404).json({ error: err.message });
+        return;
+      }
       if (err instanceof Error) {
+        if (isPgForeignKeyViolation(err)) {
+          res.status(404).json({ error: 'Store or product not found' });
+          return;
+        }
         res.status(400).json({ error: err.message });
         return;
       }
@@ -136,6 +167,17 @@ export function movementsRouter(pool: Pool): Router {
     try {
       const body = cycleCountSchema.parse(req.body);
       const result = await withTransaction(async (client) => {
+        const { rows: refs } = await client.query(
+          `SELECT (SELECT COUNT(*) FROM stores WHERE id = $1::uuid) AS stores,
+                  (SELECT COUNT(*) FROM products WHERE id = $2::uuid) AS products`,
+          [body.storeId, body.productId],
+        );
+        if (Number(refs[0]?.stores ?? 0) === 0) {
+          throw Object.assign(new Error('Store not found'), { status: 404 });
+        }
+        if (Number(refs[0]?.products ?? 0) === 0) {
+          throw Object.assign(new Error('Product not found'), { status: 404 });
+        }
         const onHand = await getOnHand(client, body.storeId, body.productId);
         const expectedQty = body.expectedQty ?? onHand;
         const count = recordCount({ expectedQty, countedQty: body.countedQty });
@@ -181,7 +223,15 @@ export function movementsRouter(pool: Pool): Router {
         res.status(409).json({ error: err.message, onHand: err.onHand });
         return;
       }
+      if (err instanceof Error && (err as { status?: unknown }).status === 404) {
+        res.status(404).json({ error: err.message });
+        return;
+      }
       if (err instanceof Error) {
+        if (isPgForeignKeyViolation(err)) {
+          res.status(404).json({ error: 'Store or product not found' });
+          return;
+        }
         res.status(400).json({ error: err.message });
         return;
       }

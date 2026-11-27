@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { z } from 'zod';
 import { priceFromCost } from '../pricing';
-import { resolveStoreId } from '../db';
+import { isPgUniqueViolation, isUuid, resolveStoreId } from '../db';
 
 const createStoreSchema = z.object({
   code: z.string().min(1),
@@ -28,9 +28,14 @@ export function storesRouter(pool: Pool): Router {
 
   router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
     try {
+      // margin_pct is the store's most common per-product margin (from
+      // product_stores); NULL when the store carries nothing yet.
       const { rows } = await pool.query(
-        `SELECT id, code, name, city, state, address, is_home, register_id, created_at
-           FROM stores ORDER BY code`,
+        `SELECT s.id, s.code, s.name, s.city, s.state, s.address, s.is_home,
+                s.register_id, s.created_at,
+                (SELECT mode() WITHIN GROUP (ORDER BY ps.margin_pct)
+                   FROM product_stores ps WHERE ps.store_id = s.id) AS margin_pct
+           FROM stores s ORDER BY s.code`,
       );
       res.json(rows);
     } catch (err) {
@@ -80,6 +85,10 @@ export function storesRouter(pool: Pool): Router {
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: 'Invalid store', details: err.issues });
+        return;
+      }
+      if (isPgUniqueViolation(err)) {
+        res.status(409).json({ error: `Store code ${req.body?.code} already exists` });
         return;
       }
       next(err);
@@ -167,8 +176,16 @@ export function storesRouter(pool: Pool): Router {
         (body.margins ?? []).map((m) => [m.productId, m.marginPct]),
       );
 
+      // Only reprice products this store already carries. Repricing every
+      // product in the catalog would silently stock uncarried products at
+      // the store (new product_stores rows) and inflate the dashboard's
+      // stocked-product / low-stock counts.
       const { rows: products } = await pool.query(
-        `SELECT id, cost_cents, price_cents FROM products`,
+        `SELECT p.id, p.cost_cents, p.price_cents
+           FROM products p
+           JOIN product_stores ps
+             ON ps.product_id = p.id AND ps.store_id = $1::uuid`,
+        [storeId],
       );
 
       const updated: Array<{ productId: string; marginPct: number; priceCents: number }> = [];

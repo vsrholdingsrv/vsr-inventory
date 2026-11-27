@@ -46,6 +46,29 @@ export async function withTransaction<T>(
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** True when the value is a well-formed UUID string. */
+export function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
+/** True when the error is a Postgres unique-violation (code 23505). */
+export function isPgUniqueViolation(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { code?: unknown }).code === '23505'
+  );
+}
+
+/** True when the error is a Postgres foreign-key violation (code 23503). */
+export function isPgForeignKeyViolation(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { code?: unknown }).code === '23503'
+  );
+}
+
 /**
  * Resolve a store by UUID id or by code (e.g. 'STORE-001') to its UUID id.
  * The old `WHERE id = $1 OR code = $1` pattern is broken in Postgres:

@@ -36,8 +36,12 @@ export default function Overview() {
     void load();
   }, [load]);
 
-  const low = products.filter((p) => p.onHand > 0 && p.onHand <= p.reorderPoint);
-  const out = products.filter((p) => p.onHand <= 0);
+  // Low/out is judged against par (the reorder target), not reorderPoint:
+  // the backend has no per-product reorder_point column yet, so
+  // reorderPoint is always 0 and `onHand <= reorderPoint` was never true
+  // for in-stock items — low-stock alerts never fired.
+  const low = products.filter((p) => p.onHand > 0 && p.par > 0 && p.onHand < p.par);
+  const out = products.filter((p) => p.onHand <= 0 && p.par > 0);
 
   async function handleRestockAll() {
     setRestocking(true);
@@ -100,7 +104,7 @@ export default function Overview() {
           ))}
           {low.map((p) => (
             <p key={p.id} className="alert-low">
-              LOW — {p.name} ({p.barcode}): {p.onHand} on hand, reorder at {p.reorderPoint}
+              LOW — {p.name} ({p.barcode}): {p.onHand} on hand, par {p.par}
             </p>
           ))}
         </div>

@@ -122,6 +122,8 @@ export default function InvoiceScan() {
                       <input
                         type="checkbox"
                         checked={l.confirmed}
+                        disabled={!matched}
+                        title={matched ? 'Confirm this line' : 'Unmatched lines cannot be confirmed or posted'}
                         onChange={(e) => updateLine(l.id, { confirmed: e.target.checked })}
                         aria-label={`Confirm line ${l.description}`}
                       />
@@ -170,8 +172,9 @@ export default function InvoiceScan() {
             </tbody>
           </table>
           <p className="muted">
-            Unmatched lines are flagged NO MATCH — ADD OR SKIP: confirm them only if you
-            want them added as new products, otherwise leave them unchecked and they
+            Unmatched lines are flagged NO MATCH — ADD OR SKIP: they cannot be
+            confirmed or posted (the checkbox is disabled). Add the product to
+            the catalog first, then re-scan, or leave them unchecked and they
             will not post.
           </p>
           <button className="primary" onClick={() => void handlePost()} disabled={busy}>

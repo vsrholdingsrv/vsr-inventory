@@ -158,6 +158,8 @@ interface StoreRow {
   state?: string | null;
   address?: string | null;
   is_home?: boolean | null;
+  /** Most common per-product margin at this store (NUMERIC comes back as a string). */
+  margin_pct?: number | string | null;
 }
 
 interface MovementRow {
@@ -227,7 +229,9 @@ function mapStore(row: StoreRow): Store {
     name: row.name,
     address: row.address ?? undefined,
     city: row.city ?? undefined,
-    marginPct: 30, // store-level default; per-product margins live in product_stores via rollout
+    // The backend returns the store's most common per-product margin;
+    // fall back to 30 only when the store carries nothing yet.
+    marginPct: row.margin_pct != null ? Number(row.margin_pct) : 30,
     status: row.is_home ? 'pilot' : 'planned',
   };
 }
@@ -280,10 +284,22 @@ async function resolveProduct(
 
 /* --------------------------------------------------------------- products */
 
+/**
+ * Products stocked at one store, with that store's on-hand and par.
+ * With no store given, the first store (home store) is used: the
+ * catalog-only endpoint has no on-hand/par columns, so calling it here
+ * used to render every product at 0 on hand with par 0 on the Overview.
+ */
 export async function getProducts(storeId?: string): Promise<Product[]> {
-  const q = storeId ? `?storeId=${encodeURIComponent(storeId)}` : '';
-  const rows = await request<ProductRow[]>(`/api/products${q}`);
-  return rows.map((r) => mapProduct(r, storeId ?? ''));
+  const sid = await defaultStoreId(storeId);
+  const rows = await request<ProductRow[]>(`/api/products?storeId=${encodeURIComponent(sid)}`);
+  return rows.map((r) => mapProduct(r, sid));
+}
+
+/** The whole catalog, no per-store stock figures (for matching/classification). */
+export async function getCatalog(): Promise<Product[]> {
+  const rows = await request<ProductRow[]>('/api/products');
+  return rows.map((r) => mapProduct(r, ''));
 }
 
 export async function getProductByBarcode(
@@ -377,12 +393,14 @@ export async function postReceive(input: {
 
 /* ------------------------------------------------------- commander pull */
 
-export async function pullPriceBook(storeId?: string): Promise<PriceBookItem[]> {
+export async function pullPriceBook(): Promise<PriceBookItem[]> {
   const { items } = await request<{ items: CommanderPriceBookRow[] }>(
     '/api/commander/price-book',
   );
   // Classify against the live catalog: the backend pull itself is unclassified.
-  const catalog = await getProducts(storeId);
+  // Use the full catalog, not one store's stocked list, or unstocked
+  // catalog products would be misclassified as "new".
+  const catalog = await getCatalog();
   const known = new Set(catalog.map((p) => p.barcode));
   return items.map((it) => ({
     barcode: it.upc,
@@ -495,6 +513,20 @@ export async function getSampleInvoice(storeId?: string): Promise<InvoiceDraft> 
   return mapInvoiceDraft(row);
 }
 
+/** Correct a draft invoice line's qty/cost before confirming it. */
+export async function updateInvoiceLine(
+  draftId: string,
+  line: InvoiceLine,
+): Promise<void> {
+  await request(`/api/invoices/${encodeURIComponent(draftId)}/lines/${encodeURIComponent(line.id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({
+      qty: Math.max(1, Math.round(line.qty)),
+      unitCostCents: Math.max(0, Math.round(line.cost * 100)),
+    }),
+  });
+}
+
 /** Post only the lines the user confirmed. Unconfirmed lines are dropped. */
 export async function postInvoiceDraft(
   draftId: string,
@@ -502,6 +534,13 @@ export async function postInvoiceDraft(
 ): Promise<Movement[]> {
   const confirmed = lines.filter((l) => l.confirmed);
   if (confirmed.length === 0) throw new Error('Confirm at least one line before posting.');
+  // Push any qty/cost edits the user made in the draft table first:
+  // the backend posts the stored line values, so edits sent only with the
+  // confirm call used to be silently ignored. Re-saving an unchanged
+  // line is harmless.
+  for (const line of confirmed) {
+    await updateInvoiceLine(draftId, line);
+  }
   const res = await request<{ movements: MovementRow[] }>(
     `/api/invoices/${encodeURIComponent(draftId)}/confirm`,
     {
@@ -509,7 +548,7 @@ export async function postInvoiceDraft(
       body: JSON.stringify({ lineIds: confirmed.map((l) => l.id) }),
     },
   );
-  const products = await getProducts();
+  const products = await getCatalog();
   const byId = new Map(
     products.map((p) => [
       p.id,
@@ -562,7 +601,10 @@ export async function updateStore(
 export async function getMovements(storeId?: string): Promise<Movement[]> {
   const q = storeId ? `?storeId=${encodeURIComponent(storeId)}` : '';
   const rows = await request<MovementRow[]>(`/api/movements${q}`);
-  const products = await getProducts(storeId);
+  // Map against the full catalog, not one store's stocked list, or
+  // movements for products not stocked at the default store would render
+  // with a blank name/barcode.
+  const products = await getCatalog();
   const byId = new Map(
     products.map((p) => [
       p.id,

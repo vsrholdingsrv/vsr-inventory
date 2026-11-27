@@ -137,6 +137,39 @@ describe('ingestVerifoneTransaction', () => {
     expect(result.postedLines).toHaveLength(1);
     expect(result.unmatchedLines).toHaveLength(1);
   });
+
+  it('shares on-hand across duplicate UPC lines in one transaction: 5 + 5 against 8 posts only 5', () => {
+    // Regression: each line used to be checked against the starting
+    // on-hand, so 5 + 5 against 8 both "passed" and stock went to -2.
+    const result = ingestVerifoneTransaction(
+      tx({
+        lines: [
+          { upc: '049000050103', qty: 5, priceCents: 199 },
+          { upc: '049000050103', qty: 5, priceCents: 199 },
+        ],
+      }),
+      { onHandByUpc: new Map([['049000050103', 8]]), seenTransactionIds: new Set() },
+    );
+    expect(result.postedLines).toHaveLength(1);
+    expect(result.postedLines[0].qty).toBe(5);
+    expect(result.unmatchedLines).toHaveLength(1);
+    expect(result.unmatchedLines[0].reason).toBe('insufficient_stock');
+    expect(result.unmatchedLines[0].detail).toMatch(/Only 3 on hand/);
+  });
+
+  it('posts two lines for the same UPC when their combined qty fits on-hand', () => {
+    const result = ingestVerifoneTransaction(
+      tx({
+        lines: [
+          { upc: '049000050103', qty: 3, priceCents: 199 },
+          { upc: '049000050103', qty: 2, priceCents: 199 },
+        ],
+      }),
+      { onHandByUpc: onHand, seenTransactionIds: new Set() },
+    );
+    expect(result.postedLines).toHaveLength(2);
+    expect(result.unmatchedLines).toHaveLength(0);
+  });
 });
 
 describe('SimulatedCommanderConnector', () => {

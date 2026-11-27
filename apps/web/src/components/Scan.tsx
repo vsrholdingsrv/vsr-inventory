@@ -117,7 +117,7 @@ export default function Scan() {
     try {
       const res = await postSale({ barcode: product.barcode, qty: sellQty });
       setProduct(res.product);
-      setMessage(`Sold ${sellQty} × ${product.name}. Transaction total ${res.transactionTotal.toFixed(2)}.`);
+      setMessage(`Sold ${sellQty} × ${product.name}. Transaction total $${res.transactionTotal.toFixed(2)}.`);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Sale failed.');
     } finally {
