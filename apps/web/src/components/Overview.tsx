@@ -6,6 +6,7 @@ import {
   type OverviewTotals,
   type Product,
 } from '../api';
+import AddProductForm from './AddProductForm';
 
 function money(n: number): string {
   return `$${n.toFixed(2)}`;
@@ -17,6 +18,7 @@ export default function Overview() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [restocking, setRestocking] = useState(false);
+  const [showAddProduct, setShowAddProduct] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -92,7 +94,21 @@ export default function Overview() {
           {restocking ? 'Restocking…' : 'Restock all to par'}
         </button>
         <p className="muted">Brings every product up to its par level (demo restock).</p>
+        <button className="secondary" onClick={() => setShowAddProduct((v) => !v)}>
+          {showAddProduct ? 'Hide add product' : '+ Add product'}
+        </button>
       </div>
+
+      {showAddProduct && (
+        <AddProductForm
+          onAdded={(p) => {
+            setShowAddProduct(false);
+            setProducts((ps) => [...ps, p]);
+            setError(null);
+          }}
+          onCancel={() => setShowAddProduct(false)}
+        />
+      )}
 
       {(low.length > 0 || out.length > 0) && (
         <div className="card">

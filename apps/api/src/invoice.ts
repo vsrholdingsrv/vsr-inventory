@@ -64,10 +64,106 @@ export class SampleInvoiceProvider implements OcrProvider {
   }
 }
 
-export function ocrProviderFromEnv(): OcrProvider {
-  return process.env.OCR_PROVIDER === 'stub'
-    ? new StubOcrProvider()
-    : new SampleInvoiceProvider();
+/**
+ * Parse OCR text (from Tesseract.js in the browser) into an invoice.
+ * The browser reads the photo and sends the *text* — the server never
+ * guesses from a photo it cannot read, and never falls back to the demo
+ * invoice: 0 parsed lines is an error, not sample data.
+ *
+ * Handles the distributor table format seen on real invoices, e.g. Red Bull:
+ *   RB1718  2  48  RED BULL 8.4OZ LS  $45.99  $2.40  $8.00  $0.00  $80.78
+ *   611269991000
+ * Columns are code, cases, UNITS, description, price/case, deposit, discount,
+ * sugar, line TOTAL. Stock moves in units, so qty = UNITS and
+ * unit cost = line total / units (discount/deposit already in the total).
+ * The 12-digit barcode usually sits on the line under the description.
+ */
+export function parseOcrText(text: string): ExtractedInvoice {
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\$/g, '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const supplierLine =
+    rawLines.find((l) => /distribution|company/i.test(l) && l.length < 80) ??
+    rawLines[0] ??
+    'Unknown supplier';
+  const supplier = supplierLine.replace(/\s+/g, ' ').trim();
+  const invoiceMatch = text.match(/invoice[:\s#]*([A-Za-z0-9][A-Za-z0-9-]{3,})/i);
+  const invoiceNumber = invoiceMatch ? invoiceMatch[1] : '';
+
+  const SKIP = /^(totals?|discount|invoice|deposit|tax|total due|units picked|number of sku|cases delivered|units delivered|id\s+qty|route:|load sheet|salesman:|cust#|terms:|po#|for billing|your signature|printed signature)/i;
+
+  const lines: InvoiceLineInput[] = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (SKIP.test(line)) continue;
+    // A bare 12-digit line is a barcode for the previous item, not a line.
+    if (/^\d{12}$/.test(line)) continue;
+
+    const m = line.match(
+      /^([A-Za-z]{1,3}\d{3,})\s+(\d+)\s+(\d+)\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$/,
+    );
+    if (m) {
+      const units = Number(m[3]);
+      const total = Number(m[9].replace(/,/g, ''));
+      if (units <= 0 || !Number.isFinite(total)) continue;
+      const barcode =
+        /^\d{12}$/.test(rawLines[i + 1] ?? '') ? rawLines[i + 1] : undefined;
+      lines.push({
+        name: cleanDescription(m[4]),
+        barcode,
+        qty: units,
+        unitCostCents: Math.round((total * 100) / units),
+      });
+      continue;
+    }
+    // Generic fallback: "DESCRIPTION  qty  $total" — total is the last number.
+    const g = line.match(/^([A-Za-z][A-Za-z0-9 .&/-]{2,})\s+(\d+)\s+\$?([\d,]+\.\d{2})\s*$/);
+    if (g && !/^\d+$/.test(g[1])) {
+      const qty = Number(g[2]);
+      const total = Number(g[3].replace(/,/g, ''));
+      if (qty > 0 && Number.isFinite(total)) {
+        lines.push({
+          name: cleanDescription(g[1]),
+          qty,
+          unitCostCents: Math.round((total * 100) / qty),
+        });
+      }
+    }
+  }
+
+  if (lines.length === 0) {
+    throw new Error(
+      'No invoice lines could be read from this photo. Try a closer, well-lit shot of the full invoice, or enter the lines manually.',
+    );
+  }
+  // De-dupe by barcode, keeping the first occurrence.
+  const seen = new Set<string>();
+  const deduped = lines.filter((l) => {
+    if (!l.barcode) return true;
+    if (seen.has(l.barcode)) return false;
+    seen.add(l.barcode);
+    return true;
+  });
+  return { supplier, invoiceNumber, lines: deduped };
+}
+
+function cleanDescription(raw: string): string {
+  return raw
+    .replace(/\s+/g, ' ')
+    .replace(/[^A-Za-z0-9 .&/-]/g, '')
+    .trim();
+}
+
+/** OCR provider that parses text the browser already read (Tesseract.js). */
+export class TextOcrProvider implements OcrProvider {
+  async extract(text: Buffer | string): Promise<ExtractedInvoice> {
+    if (typeof text !== 'string' || text.trim().length < 20) {
+      throw new Error('No readable invoice text was sent with the scan.');
+    }
+    return parseOcrText(text);
+  }
 }
 
 export interface CatalogProduct {

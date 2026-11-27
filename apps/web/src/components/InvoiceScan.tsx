@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { createWorker } from 'tesseract.js';
 import {
   getSampleInvoice,
   postInvoiceDraft,
@@ -12,16 +13,56 @@ export default function InvoiceScan() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ocrStatus, setOcrStatus] = useState<string | null>(null);
+  const [ocrText, setOcrText] = useState<string | null>(null);
 
+  /**
+   * Read the photo with Tesseract.js ON THE PHONE, then send the *text* to
+   * the server. The old flow sent only the image and the server answered
+   * with the fixed Core-Mark sample for every photo — that is why real
+   * invoices "scanned" as sample data.
+   */
   async function handleFile(file: File) {
+    if (!file.type.startsWith('image/')) {
+      setError('That file is not a photo. Take a photo or pick an image of the invoice.');
+      return;
+    }
     setBusy(true);
     setError(null);
     setMessage(null);
+    setOcrText(null);
+    let worker: Awaited<ReturnType<typeof createWorker>> | null = null;
     try {
-      setDraft(await scanInvoice(file));
+      setOcrStatus('Reading the invoice photo…');
+      worker = await createWorker('eng', undefined, {
+        logger: (m) => {
+          if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+            setOcrStatus(`Reading the invoice photo… ${Math.round(m.progress * 100)}%`);
+          }
+        },
+      });
+      const { data } = await worker.recognize(file);
+      const text = data.text ?? '';
+      setOcrText(text);
+      if (text.trim().length < 20) {
+        throw new Error(
+          'Could not read any text from this photo. Try a closer, well-lit shot of the full invoice.',
+        );
+      }
+      setOcrStatus('Matching lines to the catalog…');
+      setDraft(await scanInvoice(file, undefined, text));
+      setMessage('Draft created from your photo — review each line before posting.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Invoice scan failed.');
     } finally {
+      if (worker) {
+        try {
+          await worker.terminate();
+        } catch {
+          // Worker already stopped; nothing to do.
+        }
+      }
+      setOcrStatus(null);
       setBusy(false);
     }
   }
@@ -70,16 +111,30 @@ export default function InvoiceScan() {
       <div className="card">
         <h2>Invoice Scan</h2>
         <p className="muted">
-          Photograph or upload a supplier invoice. Lines are OCR’d into a draft —
-          nothing posts until you review and confirm each line.
+          Photograph or upload a supplier invoice. The photo is read on your
+          phone and the lines become a draft — nothing posts until you review
+          and confirm each line.
         </p>
         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
           <label className="primary" style={{ cursor: 'pointer', padding: '9px 14px', borderRadius: 6 }}>
-            Photo / upload invoice
+            Take photo
             <input
               type="file"
-              accept="image/*,application/pdf"
+              accept="image/*"
               capture="environment"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleFile(f);
+                e.target.value = '';
+              }}
+            />
+          </label>
+          <label className="secondary" style={{ cursor: 'pointer', padding: '9px 14px', borderRadius: 6 }}>
+            Choose file / Photo Library
+            <input
+              type="file"
+              accept="image/*"
               style={{ display: 'none' }}
               onChange={(e) => {
                 const f = e.target.files?.[0];
@@ -92,8 +147,15 @@ export default function InvoiceScan() {
             Load sample invoice
           </button>
         </div>
+        {busy && ocrStatus && <p className="muted">{ocrStatus}</p>}
         {error && <p className="error">{error}</p>}
         {message && <p>{message}</p>}
+        {ocrText && (
+          <details style={{ marginTop: 12 }}>
+            <summary>What was read from the photo</summary>
+            <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>{ocrText}</pre>
+          </details>
+        )}
       </div>
 
       {draft && (

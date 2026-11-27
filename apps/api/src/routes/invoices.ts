@@ -6,15 +6,17 @@ import {
   createDraft,
   InvoiceDraft,
   matchInvoiceLines,
-  ocrProviderFromEnv,
   SampleInvoiceProvider,
+  TextOcrProvider,
 } from '../invoice';
 import { isUuid, resolveStoreId, withTransaction } from '../db';
 
 const scanSchema = z.object({
   storeId: z.string().uuid(),
-  /** Base64 image (or anything the configured OCR provider accepts). Ignored by the sample provider. */
+  /** Base64 image (kept for compatibility; the photo is read in the browser). */
   imageBase64: z.string().optional(),
+  /** OCR text read from the photo by Tesseract.js in the browser. */
+  ocrText: z.string().optional(),
 });
 
 const confirmSchema = z.object({
@@ -150,8 +152,20 @@ export function invoicesRouter(pool: Pool): Router {
         return;
       }
 
-      const provider = ocrProviderFromEnv();
-      const extracted = await provider.extract(body.imageBase64 ?? '');
+      const provider = new TextOcrProvider();
+      let extracted: Awaited<ReturnType<typeof provider.extract>>;
+      try {
+        // Real scans must carry OCR text from the browser. A photo with no
+        // readable text is a 422, never the demo invoice: the old
+        // OCR_PROVIDER=sample path returned the fixed Core-Mark sample for
+        // every photo, which is why real invoices "scanned" as sample data.
+        extracted = await provider.extract(body.ocrText ?? body.imageBase64 ?? '');
+      } catch (e) {
+        res.status(422).json({
+          error: e instanceof Error ? e.message : 'Could not read this invoice photo.',
+        });
+        return;
+      }
 
       const { rows: catalog } = await pool.query(
         `SELECT id, name, barcode, cost_cents FROM products`,

@@ -302,6 +302,33 @@ export async function getCatalog(): Promise<Product[]> {
   return rows.map((r) => mapProduct(r, ''));
 }
 
+/** Add a new product and stock it at the home store (or the given store). */
+export async function createProduct(input: {
+  barcode: string;
+  name: string;
+  category?: string;
+  cost: number;
+  price?: number;
+  marginPct?: number;
+  par?: number;
+  storeId?: string;
+}): Promise<Product> {
+  const row = await request<ProductRow & { store_id?: string }>('/api/products', {
+    method: 'POST',
+    body: JSON.stringify({
+      barcode: input.barcode,
+      name: input.name,
+      category: input.category,
+      costCents: Math.round(input.cost * 100),
+      priceCents: input.price !== undefined ? Math.round(input.price * 100) : undefined,
+      marginPct: input.marginPct,
+      parQty: input.par ?? 0,
+      storeId: input.storeId,
+    }),
+  });
+  return mapProduct(row, input.storeId ?? '');
+}
+
 export async function getProductByBarcode(
   barcode: string,
   storeId?: string,
@@ -496,12 +523,16 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
-export async function scanInvoice(file: File, storeId?: string): Promise<InvoiceDraft> {
+export async function scanInvoice(
+  file: File,
+  storeId?: string,
+  ocrText?: string,
+): Promise<InvoiceDraft> {
   const sid = await defaultStoreId(storeId);
   const imageBase64 = await fileToBase64(file);
   const row = await request<InvoiceDraftRow>('/api/invoices/scan', {
     method: 'POST',
-    body: JSON.stringify({ storeId: sid, imageBase64 }),
+    body: JSON.stringify({ storeId: sid, imageBase64, ocrText }),
   });
   return mapInvoiceDraft(row);
 }

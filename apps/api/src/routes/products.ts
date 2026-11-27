@@ -7,13 +7,20 @@ import {
   resolveStoreId,
   withTransaction,
 } from '../db';
+import { priceFromCost } from '../pricing';
 
 const createProductSchema = z.object({
   barcode: z.string().min(1),
   name: z.string().min(1),
   category: z.string().optional(),
   costCents: z.number().int().min(0),
-  priceCents: z.number().int().min(0),
+  priceCents: z.number().int().min(0).optional(),
+  /** Margin % — when given, price is computed from cost + margin. */
+  marginPct: z.number().min(0).max(500).optional(),
+  /** Store to stock it at (id or code); defaults to the home store. */
+  storeId: z.string().optional(),
+  /** Par level at that store; defaults to 0 (no par yet). */
+  parQty: z.number().int().min(0).optional(),
 });
 
 export function productsRouter(pool: Pool): Router {
@@ -81,16 +88,67 @@ export function productsRouter(pool: Pool): Router {
     }
   });
 
-  // POST /api/products — add a product to the catalog.
+  // POST /api/products — add a product to the catalog AND stock it at a
+  // store. Creating the catalog row alone used to leave the product
+  // invisible everywhere: Scan looks it up per-store, so a product with
+  // no product_stores row could never be found or sold after adding.
   router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const body = createProductSchema.parse(req.body);
-      const { rows } = await pool.query(
-        `INSERT INTO products (barcode, name, category, cost_cents, price_cents)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [body.barcode, body.name, body.category ?? null, body.costCents, body.priceCents],
+      if (body.priceCents === undefined && body.marginPct === undefined) {
+        res.status(400).json({ error: 'Provide priceCents or marginPct' });
+        return;
+      }
+      const priceCents =
+        body.priceCents ?? priceFromCost(body.costCents, body.marginPct ?? 30);
+      const marginPct =
+        body.marginPct ??
+        (body.costCents > 0
+          ? Math.round(((priceCents - body.costCents) / body.costCents) * 100 * 100) / 100
+          : 30);
+      const storeId = body.storeId
+        ? await resolveStoreId(pool, body.storeId)
+        : (
+            await pool.query(`SELECT id FROM stores ORDER BY code LIMIT 1`)
+          ).rows[0]?.id;
+      if (!storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
+      const created = await (async () => {
+        // Two writes, kept together: if stocking fails, remove the
+        // catalog row so we never leave an invisible product behind.
+        // (withTransaction uses the module pool, so it can't run against
+        // a caller-supplied pool — sequential + cleanup instead.)
+        const { rows } = await pool.query(
+          `INSERT INTO products (barcode, name, category, cost_cents, price_cents)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [body.barcode, body.name, body.category ?? null, body.costCents, priceCents],
+        );
+        try {
+          await pool.query(
+            `INSERT INTO product_stores (store_id, product_id, margin_pct, price_cents, par_qty)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (store_id, product_id)
+             DO UPDATE SET margin_pct = EXCLUDED.margin_pct,
+                           price_cents = EXCLUDED.price_cents,
+                           par_qty = EXCLUDED.par_qty,
+                           updated_at = now()`,
+            [storeId, rows[0].id, marginPct, priceCents, body.parQty ?? 0],
+          );
+        } catch (err) {
+          await pool.query(`DELETE FROM products WHERE id = $1::uuid`, [rows[0].id]);
+          throw err;
+        }
+        return rows[0];
+      })();
+      const { rows: stocked } = await pool.query(
+        `SELECT product_id AS id, barcode, name, category, cost_cents,
+                price_cents, margin_pct, par_qty, on_hand
+           FROM store_inventory WHERE store_id = $1::uuid AND product_id = $2::uuid`,
+        [storeId, created.id],
       );
-      res.status(201).json(rows[0]);
+      res.status(201).json(stocked[0] ?? created);
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: 'Invalid product', details: err.issues });

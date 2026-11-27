@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { BrowserMultiFormatReader, type IScannerControls } from '@zxing/browser';
 import { DecodeHintType } from '@zxing/library';
 import { getProductByBarcode, postSale, type Product } from '../api';
+import AddProductForm from './AddProductForm';
 
 /** Demo barcodes. Coke's check digit is valid; Snickers / Pepsi are demo values. */
 const DEMO_BARCODES = [
@@ -17,6 +18,7 @@ export default function Scan() {
   const [scanning, setScanning] = useState(false);
   const [manual, setManual] = useState('');
   const [product, setProduct] = useState<Product | null>(null);
+  const [unknownBarcode, setUnknownBarcode] = useState<string | null>(null);
   const [qty, setQty] = useState(1);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -80,6 +82,7 @@ export default function Scan() {
     if (!code) return;
     setError(null);
     setMessage(null);
+    setUnknownBarcode(null);
     setBusy(true);
     try {
       const p = await getProductByBarcode(code);
@@ -87,6 +90,8 @@ export default function Scan() {
       setQty(1);
     } catch (e) {
       setProduct(null);
+      // Unknown barcode: offer to add the product instead of a dead end.
+      setUnknownBarcode(code);
       setError(e instanceof Error ? e.message : `No product found for ${code}.`);
     } finally {
       setBusy(false);
@@ -191,6 +196,20 @@ export default function Scan() {
 
       {error && <p className="error">{error}</p>}
       {message && <p>{message}</p>}
+
+      {unknownBarcode && !product && (
+        <AddProductForm
+          barcode={unknownBarcode}
+          onAdded={(p) => {
+            setUnknownBarcode(null);
+            setProduct(p);
+            setQty(1);
+            setError(null);
+            setMessage(`${p.name} added — ready to scan and sell. Receive stock first if on hand is 0.`);
+          }}
+          onCancel={() => setUnknownBarcode(null)}
+        />
+      )}
 
       {product && (
         <div className="card">

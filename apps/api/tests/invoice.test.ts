@@ -3,6 +3,7 @@ import {
   confirmLines,
   createDraft,
   matchInvoiceLines,
+  parseOcrText,
   SampleInvoiceProvider,
 } from '../src/invoice';
 
@@ -100,5 +101,67 @@ describe('invoice draft never auto-posts', () => {
     const firstId = draft.lines.find((l) => l.status === 'matched')!.id;
     confirmLines(draft, [firstId]);
     expect(() => confirmLines(draft, [firstId])).toThrow(/already confirmed/i);
+  });
+});
+
+describe('parseOcrText — real Red Bull invoice (0.1.5)', () => {
+  // OCR text as Tesseract would read the user's 2026-11-26 Red Bull photo:
+  // B+K Oil Commerce, invoice 2039427858, 6 lines, 192 units delivered.
+  const RED_BULL_OCR = [
+    'Red Bull Distribution Company Inc.',
+    'P.O. Box 204760',
+    'Dallas, TX 75320-4750',
+    'B+K Oil Commerce',
+    '2500 Union Lake Rd',
+    'Commerce Twp, MI 48382',
+    'Route: 390A11',
+    'Cust#: 3000142426',
+    'Invoice: 2039427858',
+    '11/26/2026 1:16 PM',
+    'ID QTY UNITS DESCRIPTION PRICE DEP DISC SUGAR TOTAL',
+    'RB1718 2 48 RED BULL 8.4OZ LS $45.99 $2.40 $8.00 $0.00 $80.78',
+    '611269991000',
+    'RB249731 1 24 W PEACH 12OZ $58.71 $2.40 $8.00 $0.00 $53.11',
+    '611269002706',
+    'RB248898 1 24 ICED 12OZ $58.71 $2.40 $8.00 $0.00 $53.11',
+    '611269001846',
+    'RB253417 1 24 APPLE 12OZ LS $58.71 $2.40 $8.00 $0.00 $53.11',
+    '611269002867',
+    'RB221027 1 24 COCONUT 12OZ LS $58.71 $2.40 $8.00 $0.00 $53.11',
+    '611269321210',
+    'RB4817 2 48 SUGARFREE 12OZ LS $58.71 $2.40 $8.00 $0.00 $106.22',
+    '611269716467',
+    'Units Picked Up (0)',
+    'Number of SKU\u2019s 6',
+    'Cases Delivered 8',
+    'Units Delivered 192',
+    'TOTALS',
+    'DISCOUNT $64.00',
+    'INVOICE $399.44',
+    'TOTAL DUE: $0.00',
+  ].join('\n');
+
+  it('parses 6 lines with units, barcodes and unit costs — not the Core-Mark sample', () => {
+    const inv = parseOcrText(RED_BULL_OCR);
+    expect(inv.supplier).toMatch(/Red Bull/i);
+    expect(inv.invoiceNumber).toBe('2039427858');
+    expect(inv.lines).toHaveLength(6);
+    expect(inv.lines.map((l) => l.qty)).toEqual([48, 24, 24, 24, 24, 48]);
+    expect(inv.lines.map((l) => l.barcode)).toEqual([
+      '611269991000',
+      '611269002706',
+      '611269001846',
+      '611269002867',
+      '611269321210',
+      '611269716467',
+    ]);
+    // Unit cost = line total / units: 80.78/48 = $1.68, 53.11/24 = $2.21.
+    expect(inv.lines.map((l) => l.unitCostCents)).toEqual([168, 221, 221, 221, 221, 221]);
+    expect(inv.lines.reduce((s, l) => s + l.qty, 0)).toBe(192);
+    expect(inv.supplier).not.toBe('Core-Mark');
+  });
+
+  it('throws instead of returning sample data when no lines are readable', () => {
+    expect(() => parseOcrText('Hello world\nnothing here')).toThrow(/No invoice lines/);
   });
 });

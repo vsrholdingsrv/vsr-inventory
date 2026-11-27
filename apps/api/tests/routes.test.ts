@@ -98,6 +98,11 @@ describe('stores / products routes with a fake pool', () => {
 
   beforeAll(async () => {
     const { pool } = fakePool([
+      // POST /api/products with no storeId: default (first) store
+      (q) =>
+        q.sql.includes('FROM stores ORDER BY code LIMIT 1')
+          ? { rows: [{ id: STORE_ID }] }
+          : null,
       // resolveStoreId by code
       (q) =>
         q.sql.includes('FROM stores WHERE code = $1')
