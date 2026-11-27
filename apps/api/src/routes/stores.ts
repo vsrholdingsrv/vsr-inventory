@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { z } from 'zod';
 import { priceFromCost } from '../pricing';
+import { resolveStoreId } from '../db';
 
 const createStoreSchema = z.object({
   code: z.string().min(1),
@@ -39,10 +40,15 @@ export function storesRouter(pool: Pool): Router {
 
   router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
     try {
+      const storeId = await resolveStoreId(pool, req.params.id);
+      if (!storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
       const { rows } = await pool.query(
         `SELECT id, code, name, city, state, address, is_home, register_id, created_at
-           FROM stores WHERE id = $1 OR code = $1`,
-        [req.params.id],
+           FROM stores WHERE id = $1::uuid`,
+        [storeId],
       );
       if (rows.length === 0) {
         res.status(404).json({ error: 'Store not found' });
@@ -114,9 +120,14 @@ export function storesRouter(pool: Pool): Router {
         res.status(400).json({ error: 'Nothing to update' });
         return;
       }
-      params.push(req.params.id);
+      const storeId = await resolveStoreId(pool, req.params.id);
+      if (!storeId) {
+        res.status(404).json({ error: 'Store not found' });
+        return;
+      }
+      params.push(storeId);
       const { rows } = await pool.query(
-        `UPDATE stores SET ${sets.join(', ')} WHERE id = $${params.length} OR code = $${params.length} RETURNING *`,
+        `UPDATE stores SET ${sets.join(', ')} WHERE id = $${params.length}::uuid RETURNING *`,
         params,
       );
       if (rows.length === 0) {
@@ -146,15 +157,11 @@ export function storesRouter(pool: Pool): Router {
         return;
       }
 
-      const store = await pool.query(
-        `SELECT id FROM stores WHERE id = $1 OR code = $1`,
-        [req.params.id],
-      );
-      if (store.rows.length === 0) {
+      const storeId = await resolveStoreId(pool, req.params.id);
+      if (!storeId) {
         res.status(404).json({ error: 'Store not found' });
         return;
       }
-      const storeId: string = store.rows[0].id;
 
       const explicit = new Map(
         (body.margins ?? []).map((m) => [m.productId, m.marginPct]),

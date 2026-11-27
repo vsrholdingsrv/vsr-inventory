@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { z } from 'zod';
-import { withTransaction } from '../db';
+import { resolveStoreId, withTransaction } from '../db';
 
 const createProductSchema = z.object({
   barcode: z.string().min(1),
@@ -89,17 +89,17 @@ export function productsRouter(pool: Pool): Router {
   router.post('/restock-all', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const requested = typeof req.body?.storeId === 'string' ? req.body.storeId : null;
-      const storeRes = await pool.query(
-        requested
-          ? `SELECT id FROM stores WHERE id = $1 OR code = $1`
-          : `SELECT id FROM stores ORDER BY code LIMIT 1`,
-        requested ? [requested] : [],
-      );
-      if (storeRes.rows.length === 0) {
+      const storeId = requested
+        ? await resolveStoreId(pool, requested)
+        : (
+            await pool.query(
+              `SELECT id FROM stores ORDER BY code LIMIT 1`,
+            )
+          ).rows[0]?.id;
+      if (!storeId) {
         res.status(404).json({ error: 'Store not found' });
         return;
       }
-      const storeId: string = storeRes.rows[0].id;
       const { rows: below } = await pool.query(
         `SELECT product_id, on_hand, par_qty, cost_cents
            FROM store_inventory WHERE store_id = $1 AND on_hand < par_qty`,

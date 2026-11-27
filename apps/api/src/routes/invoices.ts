@@ -9,7 +9,7 @@ import {
   ocrProviderFromEnv,
   SampleInvoiceProvider,
 } from '../invoice';
-import { withTransaction } from '../db';
+import { resolveStoreId, withTransaction } from '../db';
 
 const scanSchema = z.object({
   storeId: z.string().uuid(),
@@ -51,17 +51,17 @@ export function invoicesRouter(pool: Pool): Router {
   router.get('/sample', async (req: Request, res: Response, next: NextFunction) => {
     try {
       const requested = typeof req.query.storeId === 'string' ? req.query.storeId : null;
-      const storeRes = await pool.query(
-        requested
-          ? `SELECT id FROM stores WHERE id = $1 OR code = $1`
-          : `SELECT id FROM stores ORDER BY code LIMIT 1`,
-        requested ? [requested] : [],
-      );
-      if (storeRes.rows.length === 0) {
+      const storeId = requested
+        ? await resolveStoreId(pool, requested)
+        : (
+            await pool.query(
+              `SELECT id FROM stores ORDER BY code LIMIT 1`,
+            )
+          ).rows[0]?.id;
+      if (!storeId) {
         res.status(404).json({ error: 'Store not found' });
         return;
       }
-      const storeId: string = storeRes.rows[0].id;
       const extracted = await new SampleInvoiceProvider().extract('');
       const { rows: catalog } = await pool.query(
         `SELECT id, name, barcode, cost_cents FROM products`,

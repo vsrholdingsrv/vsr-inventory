@@ -43,6 +43,37 @@ export async function withTransaction<T>(
   }
 }
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolve a store by UUID id or by code (e.g. 'STORE-001') to its UUID id.
+ * The old `WHERE id = $1 OR code = $1` pattern is broken in Postgres:
+ * one parameter compared to both a uuid column and a text column makes
+ * Postgres pick text, and `text = uuid` errors with 42883
+ * ("operator does not exist: text = uuid"). Querying by one column at a
+ * time, with an explicit ::uuid cast for ids, avoids that entirely.
+ */
+export async function resolveStoreId(
+  pool: Pool,
+  idOrCode: string,
+): Promise<string | null> {
+  const rows = UUID_RE.test(idOrCode)
+    ? (
+        await pool.query<{ id: string }>(
+          `SELECT id FROM stores WHERE id = $1::uuid`,
+          [idOrCode],
+        )
+      ).rows
+    : (
+        await pool.query<{ id: string }>(
+          `SELECT id FROM stores WHERE code = $1`,
+          [idOrCode],
+        )
+      ).rows;
+  return rows[0]?.id ?? null;
+}
+
 /** On-hand for one (store, product), computed from the ledger — never stored. */
 export async function getOnHand(
   client: Pool | PoolClient,
