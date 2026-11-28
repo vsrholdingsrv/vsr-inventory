@@ -4,8 +4,10 @@ import { z } from 'zod';
 import {
   confirmLines,
   createDraft,
+  extractInvoiceHeader,
   InvoiceDraft,
   matchInvoiceLines,
+  parseOcrRows,
   reconcileInvoice,
   SampleInvoiceProvider,
   TextOcrProvider,
@@ -18,6 +20,8 @@ const scanSchema = z.object({
   imageBase64: z.string().optional(),
   /** OCR text read from the photo by Tesseract.js in the browser. */
   ocrText: z.string().optional(),
+  /** Rows rebuilt from Tesseract word positions (see InvoiceScan). */
+  ocrRows: z.array(z.string()).optional(),
 });
 
 const confirmSchema = z.object({
@@ -233,12 +237,32 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
 
       const provider = new TextOcrProvider();
       let extracted: Awaited<ReturnType<typeof provider.extract>>;
+      let reconText = body.ocrText ?? '';
       try {
-        // Real scans must carry OCR text from the browser. A photo with no
-        // readable text is a 422, never the demo invoice: the old
-        // OCR_PROVIDER=sample path returned the fixed Core-Mark sample for
-        // every photo, which is why real invoices "scanned" as sample data.
-        extracted = await provider.extract(body.ocrText ?? body.imageBase64 ?? '');
+        // Rows rebuilt from word positions read the table far better than
+        // plain OCR text, which scatters a row's fields across lines.
+        // Fall back to plain text when no rows were sent.
+        if (body.ocrRows && body.ocrRows.length > 0) {
+          const rowsText = body.ocrRows.join('\n');
+          const { supplier, invoiceNumber } = extractInvoiceHeader(rowsText);
+          extracted = {
+            supplier,
+            invoiceNumber,
+            lines: parseOcrRows(body.ocrRows),
+          };
+          reconText = rowsText;
+          if (extracted.lines.length === 0) {
+            throw new Error(
+              'No invoice lines could be read from this photo. Try a closer, well-lit shot of the full invoice, or enter the lines manually.',
+            );
+          }
+        } else {
+          // Real scans must carry OCR text from the browser. A photo with no
+          // readable text is a 422, never the demo invoice: the old
+          // OCR_PROVIDER=sample path returned the fixed Core-Mark sample for
+          // every photo, which is why real invoices "scanned" as sample data.
+          extracted = await provider.extract(body.ocrText ?? body.imageBase64 ?? '');
+        }
       } catch (e) {
         res.status(422).json({
           error: e instanceof Error ? e.message : 'Could not read this invoice photo.',
@@ -298,7 +322,7 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
       res.status(201).json({
         ...draft,
         lines,
-        reconciliation: reconcileInvoice(body.ocrText ?? '', matched),
+        reconciliation: reconcileInvoice(reconText, matched),
       });
     } catch (err) {
       if (err instanceof z.ZodError) {

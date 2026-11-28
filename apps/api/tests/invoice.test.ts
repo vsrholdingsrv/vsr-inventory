@@ -3,6 +3,7 @@ import {
   confirmLines,
   createDraft,
   matchInvoiceLines,
+  parseOcrRows,
   parseOcrText,
   reconcileInvoice,
   SampleInvoiceProvider,
@@ -280,5 +281,36 @@ describe('parseOcrText — junk rejection + reconciliation (0.1.8)', () => {
     // the printed $399.44 — inside the $2 reconciliation tolerance.
     expect(Math.abs(r.linesTotalCents - 39944)).toBeLessThanOrEqual(200);
     expect(r.matches).toBe(true);
+  });
+});
+
+describe('parseOcrRows — TSV-grouped rows from the Red Bull photo (0.1.9)', () => {
+  // Rows rebuilt from Tesseract word positions (tol 22) on the cleaned
+  // photo. The reader still misreads digits (48→4, 24→44, $53.11→$63.11)
+  // and loses the ICED total entirely, so the draft comes back with 5 of
+  // 6 lines and a totals mismatch — reviewable and fixable, not a 422.
+  const ROWS = [
+    'BEE PR SR 2 pif a] RB1718 2 4 REDBULL 840715 5 gup00 Gh $24 ee 80.78 ill',
+    'PER GEER Ro2ao71 1 44 W PEACH 1207 9100 0 $68.71 $53.11 |',
+    'CNR SER RE248808 1 2g ICED 1207 611269002 11269002706 $58.7',
+    'Eales 0. ¥ RB253417 1 24 APPLE 120Z LS $58. $63.11',
+    's "ial hg BS "4 RB221027 1 24 COCONUT 120Z 611269002867 LS $58.71 $',
+    '2 48 SUGARFREE 120ZLs ~~ $68.71 § 2.40 Si . ae : $106.22',
+    'Ay, INVOICE $399.44 Tu wr',
+    'Dur Delivered 192 TAX $0.00 ir',
+  ];
+  it('parses 5 of 6 lines and flags the totals mismatch', () => {
+    const lines = parseOcrRows(ROWS);
+    expect(lines).toHaveLength(5);
+    expect(lines.map((l) => l.qty)).toEqual([4, 44, 24, 24, 48]);
+    expect(lines[4].name).toMatch(/SUGARFREE/);
+    expect(lines[4].unitCostCents).toBe(221);
+    expect(lines[3].barcode).toBe('611269002867');
+    const r = reconcileInvoice(ROWS.join('\n'), lines);
+    expect(r.expectedTotalCents).toBe(39944);
+    // "Units Delivered" itself was misread as "Dur Delivered", so the
+    // units check has nothing to compare against — the total alone flags it.
+    expect(r.expectedUnits).toBeNull();
+    expect(r.matches).toBe(false);
   });
 });

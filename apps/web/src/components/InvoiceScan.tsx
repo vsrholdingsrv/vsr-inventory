@@ -16,7 +16,7 @@ import {
  * photo this lifted the reader's hit rate on codes and totals from ~40%
  * to ~60% — still not perfect, which is why the paste-text path exists.
  */
-async function preprocessImage(file: File): Promise<Blob> {
+async function preprocessImage(file: File): Promise<{ blob: Blob; width: number; height: number }> {
   const url = URL.createObjectURL(file);
   try {
     const img = await new Promise<HTMLImageElement>((resolve, reject) => {
@@ -30,7 +30,7 @@ async function preprocessImage(file: File): Promise<Blob> {
     canvas.width = Math.round(img.width * scale);
     canvas.height = Math.round(img.height * scale);
     const ctx = canvas.getContext('2d');
-    if (!ctx) return file;
+    if (!ctx) return { blob: file, width: 0, height: 0 };
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const px = data.data;
@@ -47,7 +47,7 @@ async function preprocessImage(file: File): Promise<Blob> {
     let hi = 255;
     acc = 0;
     while (hi > 0 && acc < total * 0.01) acc += hist[hi--];
-    if (hi <= lo) return file;
+    if (hi <= lo) return { blob: file, width: canvas.width, height: canvas.height };
     const range = hi - lo;
     for (let i = 0; i < px.length; i += 4) {
       const g = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
@@ -61,10 +61,47 @@ async function preprocessImage(file: File): Promise<Blob> {
     const blob = await new Promise<Blob | null>((resolve) =>
       canvas.toBlob(resolve, 'image/png'),
     );
-    return blob ?? file;
+    return { blob: blob ?? file, width: canvas.width, height: canvas.height };
   } finally {
     URL.revokeObjectURL(url);
   }
+}
+
+/**
+ * Rebuild invoice table rows from Tesseract's word positions (TSV level 5).
+ * Plain OCR text scatters one row's fields across lines — the code on one
+ * line, the money on another — which is why photo scans came back empty or
+ * wrong. Words sharing a vertical band are one row, whatever order the
+ * reader emitted them in.
+ */
+function groupWordsIntoRows(tsv: string, imageHeight: number): string[] {
+  const tol = Math.max(14, Math.round(imageHeight * 0.0065));
+  const rows: { yc: number; words: { left: number; text: string }[] }[] = [];
+  for (const line of tsv.split('\n').slice(1)) {
+    const c = line.split('\t');
+    if (c[0] !== '5' || !c[11] || !c[11].trim()) continue;
+    const left = Number(c[6]);
+    const top = Number(c[7]);
+    const h = Number(c[9]);
+    if (!Number.isFinite(left) || !Number.isFinite(top) || !Number.isFinite(h)) continue;
+    const yc = top + h / 2;
+    let g = rows.find((r) => Math.abs(r.yc - yc) <= tol);
+    if (!g) {
+      g = { yc, words: [] };
+      rows.push(g);
+    }
+    g.words.push({ left, text: c[11].trim() });
+    g.yc = g.words.reduce((s) => s + yc, 0) / g.words.length;
+  }
+  rows.sort((a, b) => a.yc - b.yc);
+  return rows
+    .map((r) =>
+      r.words
+        .sort((a, b) => a.left - b.left)
+        .map((w) => w.text)
+        .join(' '),
+    )
+    .filter(Boolean);
 }
 
 export default function InvoiceScan() {
@@ -163,7 +200,10 @@ export default function InvoiceScan() {
       // better than the default auto page segmentation (PSM 3), which
       // scrambles table rows and is why clean photos came back unreadable.
       await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK });
-      const { data } = await worker.recognize(clean);
+      // Ask for TSV too: word positions let the server rebuild each table
+      // row from words sharing a vertical band, instead of trusting the
+      // reader's line order (which splits one row across several lines).
+      const { data } = await worker.recognize(clean.blob, {}, { text: true, tsv: true });
       const text = data.text ?? '';
       setOcrText(text);
       if (text.trim().length < 20) {
@@ -171,8 +211,12 @@ export default function InvoiceScan() {
           'Could not read any text from this photo. Try a closer, well-lit shot of the full invoice.',
         );
       }
+      const rows =
+        typeof data.tsv === 'string' && clean.height > 0
+          ? groupWordsIntoRows(data.tsv, clean.height)
+          : [];
       setOcrStatus('Matching lines to the catalog…');
-      setDraft(await scanInvoice(file, undefined, text));
+      setDraft(await scanInvoice(file, undefined, text, rows.length ? rows : undefined));
       setMessage('Draft created from your photo — review each line before posting.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Invoice scan failed.');

@@ -538,12 +538,13 @@ export async function scanInvoice(
   file: File,
   storeId?: string,
   ocrText?: string,
+  ocrRows?: string[],
 ): Promise<InvoiceDraft> {
   const sid = await defaultStoreId(storeId);
   const imageBase64 = await fileToBase64(file);
   const row = await request<InvoiceDraftRow>('/api/invoices/scan', {
     method: 'POST',
-    body: JSON.stringify({ storeId: sid, imageBase64, ocrText }),
+    body: JSON.stringify({ storeId: sid, imageBase64, ocrText, ocrRows }),
   });
   return mapInvoiceDraft(row);
 }

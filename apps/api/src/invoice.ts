@@ -78,12 +78,14 @@ export class SampleInvoiceProvider implements OcrProvider {
  * unit cost = line total / units (discount/deposit already in the total).
  * The 12-digit barcode usually sits on the line under the description.
  */
-export function parseOcrText(text: string): ExtractedInvoice {
+export function extractInvoiceHeader(text: string): {
+  supplier: string;
+  invoiceNumber: string;
+} {
   const rawLines = text
     .split(/\r?\n/)
     .map((l) => l.replace(/\$/g, '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
-
   const supplierLine =
     rawLines.find((l) => /distribution|company/i.test(l) && l.length < 80) ??
     rawLines[0] ??
@@ -97,10 +99,125 @@ export function parseOcrText(text: string): ExtractedInvoice {
   const invoiceMatch = text.match(/invoice[:\s#]*([A-Za-z0-9][A-Za-z0-9-]{4,})/i);
   const invoiceNumber =
     invoiceMatch && /\d{5,}/.test(invoiceMatch[1]) ? invoiceMatch[1] : '';
+  return { supplier, invoiceNumber };
+}
+
+/**
+ * Parse already-grouped invoice rows into lines. Each row is one table
+ * row — either a Tesseract text line (pasted text) or a row rebuilt from
+ * TSV word positions (photo scan), which keeps a row's code, quantities,
+ * description and money values together even when Tesseract's plain text
+ * scatters them across lines.
+ *
+ * Tolerant row parse: last money value is the line total; the quantities
+ * are the first two integers AFTER the item code (cases + UNITS — stock
+ * moves in units), or the first two integers in the row when there is no
+ * code; everything between them and the money tail is the description.
+ * The item code is optional — OCR often drops or garbles it.
+ */
+export function parseOcrRows(rows: string[]): InvoiceLineInput[] {
+  const SKIP = /^(totals?|discount|invoice|deposit|tax|total due|units picked|number of sku|cases delivered|units delivered|id\s+qty|route:|load sheet|salesman:|cust#|terms:|po#|for billing|your signature|printed signature)/i;
+  const lines: InvoiceLineInput[] = [];
+  for (let i = 0; i < rows.length; i++) {
+    const line = rows[i];
+    if (SKIP.test(line)) continue;
+    // Totals/summary block: these phrases never appear in a real item row,
+    // wherever they sit in a merged line — drop the whole line.
+    if (/number of sku|units picked|units delivered|cases delivered|total due|check:|c\. applied|roa:/i.test(line)) continue;
+    // A bare 12-digit line is a barcode for the previous item, not a line.
+    if (/^\d{12}$/.test(line)) continue;
+
+    // Sanity guards (a folded/angled photo misreads digits badly, e.g. 48
+    // as "4s" and $58.71 as $68.71): a row is only trusted if it has at
+    // least 2 money values, qty 1–999, and a unit cost between $0.05 and
+    // $200. Rows failing these are dropped — a wrong draft line is worse
+    // than no draft line, and the draft is review-only either way.
+    const moneys = [...line.matchAll(/(\d{1,3}(?:,\d{3})*\.\d{2})/g)].map((m) =>
+      Number(m[1].replace(/,/g, '')),
+    );
+    // OCR also mangles money into dollar-prefixed integers ("$58.71" →
+    // "$58", "$2.40" → "$24"). Those are not usable as a total, but they
+    // still count as evidence that the row carries money — a row whose
+    // only decimal money is its total would otherwise be dropped.
+    const moneyishCount =
+      moneys.length +
+      [...line.matchAll(/\$\s*\d{1,3}(?:,\d{3})*(?!\.\d)/g)].length;
+    if (moneyishCount < 2 || moneys.length < 1) continue;
+    const total = moneys[moneys.length - 1];
+    // Head = everything before the first money value.
+    const firstMoneyIdx = line.search(/\d{1,3}(?:,\d{3})*\.\d{2}/);
+    const head = line.slice(0, firstMoneyIdx).trim();
+    // Quantities live right after the item code: "RB1718 2 48 …" → cases 2,
+    // units 48. Reading ints from the whole head misfires on TSV rows,
+    // whose junk prefix carries the code's own digits ("RB1718" → 1718)
+    // and mangled description digits ("840715").
+    const codeMatch = head.match(/[A-Za-z]{1,4}\d{2,}/);
+    const qtyRegion = codeMatch
+      ? head.slice(codeMatch.index! + codeMatch[0].length)
+      : head;
+    const intTokens = [...qtyRegion.matchAll(/\b(\d+)\b/g)].map((m) => m[1]);
+    const ints = intTokens.map(Number);
+    if (ints.length === 0 || !Number.isFinite(total) || total <= 0) continue;
+    const qty = ints.length >= 2 ? ints[1] : ints[0];
+    // No integer longer than 4 digits among the quantity candidates — a
+    // barcode fragment leaking into the quantities. (Later ints in the
+    // region, like a mangled "840715" from "8.4OZ", are description noise
+    // and are ignored.)
+    if (intTokens.slice(0, 2).some((t) => t.length > 4)) continue;
+    if (qty < 1 || qty > 999) continue;
+    const unitCostCents = Math.round((total * 100) / qty);
+    if (unitCostCents < 5 || unitCostCents > 20000) continue;
+    // Description: from the item code onward, minus the code and the two
+    // qty integers. Junk before the code (TSV row prefixes) is dropped.
+    let descSource = codeMatch
+      ? head.slice(codeMatch.index!)
+      : head;
+    let desc = descSource
+      .replace(/^[A-Za-z]{1,4}[\d-]{2,}\s+/, '')
+      .replace(/\b\d+\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    desc = cleanDescription(desc);
+    if (!/[A-Za-z]{3,}/.test(desc)) continue;
+    // Barcode: a 12-digit token in this line, or the bare line after it.
+    const inLineBarcode = line.match(/\b(\d{12})\b/);
+    const barcode =
+      inLineBarcode?.[1] ??
+      (/^\d{12}$/.test(rows[i + 1] ?? '') ? rows[i + 1] : undefined);
+    // A trusted row must carry an item code (RB1718), a barcode, or at
+    // least 3 money values (a full distributor money row). Without any
+    // anchor the numbers are unanchored OCR noise — the junk line in the
+    // user's screenshot ("oo HE A Tamme . Ti Sa an LL", qty 8 @ $58.25,
+    // only 2 money values) passed every numeric guard and still was not a
+    // real invoice line.
+    const hasCode = !!codeMatch;
+    if (!hasCode && !barcode && moneys.length < 3) continue;
+    lines.push({
+      name: desc,
+      barcode,
+      qty,
+      unitCostCents,
+    });
+  }
+  // De-dupe by barcode, keeping the first occurrence.
+  const seen = new Set<string>();
+  return lines.filter((l) => {
+    if (!l.barcode) return true;
+    if (seen.has(l.barcode)) return false;
+    seen.add(l.barcode);
+    return true;
+  });
+}
+
+export function parseOcrText(text: string): ExtractedInvoice {
+  const { supplier, invoiceNumber } = extractInvoiceHeader(text);
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\$/g, '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
 
   const SKIP = /^(totals?|discount|invoice|deposit|tax|total due|units picked|number of sku|cases delivered|units delivered|id\s+qty|route:|load sheet|salesman:|cust#|terms:|po#|for billing|your signature|printed signature)/i;
 
-  const lines: InvoiceLineInput[] = [];
   // Tesseract often splits one table row across two text lines
   // ("RB1718 2 48 RED BULL 8.4OZ LS" / "45.99 2.40 8.00 0.00 80.78"), so
   // accumulate lines into a buffer and flush it as one logical row when a
@@ -127,86 +244,14 @@ export function parseOcrText(text: string): ExtractedInvoice {
   }
   flush();
 
-  for (let i = 0; i < logical.length; i++) {
-    const line = logical[i];
-    if (SKIP.test(line)) continue;
-    // Totals/summary block: these phrases never appear in a real item row,
-    // wherever they sit in a merged line — drop the whole line.
-    if (/number of sku|units picked|units delivered|cases delivered|total due|check:|c\. applied|roa:/i.test(line)) continue;
-    // A bare 12-digit line is a barcode for the previous item, not a line.
-    if (/^\d{12}$/.test(line)) continue;
-
-    // Tolerant row parse: last money value is the line total, the first two
-    // integers are cases + UNITS (stock moves in units), and everything
-    // between them and the money tail is the description. The item code is
-    // optional — OCR often drops or garbles it.
-    //
-    // Sanity guards (a folded/angled photo misreads digits badly, e.g. 48
-    // as "4s" and $58.71 as $68.71): a row is only trusted if it has at
-    // least 2 money values, no integer longer than 4 digits in the head
-    // (a barcode fragment leaking into the quantity), qty 1–999, and a
-    // unit cost between $0.05 and $200. Rows failing these are dropped —
-    // a wrong draft line is worse than no draft line, and the draft is
-    // review-only either way.
-    const moneys = [...line.matchAll(/(\d{1,3}(?:,\d{3})*\.\d{2})/g)].map((m) =>
-      Number(m[1].replace(/,/g, '')),
-    );
-    if (moneys.length < 2) continue;
-    const total = moneys[moneys.length - 1];
-    // Head = everything before the first money value.
-    const firstMoneyIdx = line.search(/\d{1,3}(?:,\d{3})*\.\d{2}/);
-    const head = line.slice(0, firstMoneyIdx).trim();
-    const intTokens = [...head.matchAll(/\b(\d+)\b/g)].map((m) => m[1]);
-    if (intTokens.some((t) => t.length > 4)) continue;
-    const ints = intTokens.map(Number);
-    if (ints.length === 0 || !Number.isFinite(total) || total <= 0) continue;
-    const qty = ints.length >= 2 ? ints[1] : ints[0];
-    if (qty < 1 || qty > 999) continue;
-    const unitCostCents = Math.round((total * 100) / qty);
-    if (unitCostCents < 5 || unitCostCents > 20000) continue;
-    // Description: head minus a leading item code and the two qty integers.
-    let desc = head
-      .replace(/^[A-Za-z]{1,4}[\d-]{2,}\s+/, '')
-      .replace(/\b\d+\b/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    desc = cleanDescription(desc);
-    if (!/[A-Za-z]{3,}/.test(desc)) continue;
-    // Barcode: a 12-digit token in this line, or the bare line after it.
-    const inLineBarcode = line.match(/\b(\d{12})\b/);
-    const barcode =
-      inLineBarcode?.[1] ??
-      (/^\d{12}$/.test(logical[i + 1] ?? '') ? logical[i + 1] : undefined);
-    // A trusted row must carry an item code (RB1718), a barcode, or a full
-    // distributor money row (price + deposit + discount + sugar + total).
-    // Without any anchor the numbers are unanchored OCR noise — the junk
-    // line in the user's screenshot ("oo HE A Tamme . Ti Sa an LL", qty 8
-    // @ $58.25, only 2 money values) passed every numeric guard and still
-    // was not a real invoice line.
-    const hasCode = /[A-Za-z]{1,4}\d{2,}/.test(head);
-    if (!hasCode && !barcode && moneys.length < 4) continue;
-    lines.push({
-      name: desc,
-      barcode,
-      qty,
-      unitCostCents,
-    });
-  }
+  const lines = parseOcrRows(logical);
 
   if (lines.length === 0) {
     throw new Error(
       'No invoice lines could be read from this photo. Try a closer, well-lit shot of the full invoice, or enter the lines manually.',
     );
   }
-  // De-dupe by barcode, keeping the first occurrence.
-  const seen = new Set<string>();
-  const deduped = lines.filter((l) => {
-    if (!l.barcode) return true;
-    if (seen.has(l.barcode)) return false;
-    seen.add(l.barcode);
-    return true;
-  });
-  return { supplier, invoiceNumber, lines: deduped };
+  return { supplier, invoiceNumber, lines };
 }
 
 export interface Reconciliation {
