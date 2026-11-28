@@ -1,6 +1,8 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { Pool } from 'pg';
 import { z } from 'zod';
+import { readInvoiceWithVision } from '../vision';
+import { readInvoiceWithOpenAi } from '../openai';
 import {
   confirmLines,
   createDraft,
@@ -236,32 +238,76 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
       }
 
       const provider = new TextOcrProvider();
-      let extracted: Awaited<ReturnType<typeof provider.extract>>;
+      let extracted: Awaited<ReturnType<typeof provider.extract>> | undefined;
       let reconText = body.ocrText ?? '';
+      // OpenAI's own totals, when the vision model read them — more
+      // reliable than scraping them out of OCR text.
+      let reconOverride: { expectedTotalCents: number | null; expectedUnits: number | null } | null = null;
       try {
-        // Rows rebuilt from word positions read the table far better than
-        // plain OCR text, which scatters a row's fields across lines.
-        // Fall back to plain text when no rows were sent.
-        if (body.ocrRows && body.ocrRows.length > 0) {
-          const rowsText = body.ocrRows.join('\n');
-          const { supplier, invoiceNumber } = extractInvoiceHeader(rowsText);
-          extracted = {
-            supplier,
-            invoiceNumber,
-            lines: parseOcrRows(body.ocrRows),
-          };
-          reconText = rowsText;
-          if (extracted.lines.length === 0) {
-            throw new Error(
-              'No invoice lines could be read from this photo. Try a closer, well-lit shot of the full invoice, or enter the lines manually.',
-            );
+        // Exact-details path, first choice: GPT-4o vision on the server.
+        // The phone's built-in reader (Tesseract) was tested every way on
+        // the user's Red Bull invoice and never got all 6 lines right.
+        // Any OpenAI failure falls back to the next reader, never fails
+        // the scan outright.
+        const openAiKey = process.env.OPENAI_API_KEY;
+        if (body.imageBase64 && openAiKey) {
+          try {
+            const ai = await readInvoiceWithOpenAi(body.imageBase64, openAiKey);
+            if (ai.lines.length > 0) {
+              extracted = {
+                supplier: ai.supplier,
+                invoiceNumber: ai.invoiceNumber,
+                lines: ai.lines,
+              };
+              reconOverride = {
+                expectedTotalCents: ai.expectedTotalCents,
+                expectedUnits: ai.expectedUnits,
+              };
+            }
+          } catch (e) {
+            console.warn('[invoice] OpenAI read failed, falling back:', e);
           }
-        } else {
-          // Real scans must carry OCR text from the browser. A photo with no
-          // readable text is a 422, never the demo invoice: the old
-          // OCR_PROVIDER=sample path returned the fixed Core-Mark sample for
-          // every photo, which is why real invoices "scanned" as sample data.
-          extracted = await provider.extract(body.ocrText ?? body.imageBase64 ?? '');
+        }
+        // Exact-details path, second choice: Google Cloud Vision.
+        const visionKey = process.env.GOOGLE_VISION_API_KEY;
+        if (!extracted && body.imageBase64 && visionKey) {
+          try {
+            const vision = await readInvoiceWithVision(body.imageBase64, visionKey);
+            const { supplier, invoiceNumber } = extractInvoiceHeader(vision.text);
+            const visionLines = parseOcrRows(vision.rows);
+            if (visionLines.length > 0) {
+              extracted = { supplier, invoiceNumber, lines: visionLines };
+              reconText = vision.text;
+            }
+          } catch (e) {
+            console.warn('[invoice] Vision read failed, falling back to phone OCR:', e);
+          }
+        }
+        if (!extracted) {
+          // Rows rebuilt from word positions read the table far better than
+          // plain OCR text, which scatters a row's fields across lines.
+          // Fall back to plain text when no rows were sent.
+          if (body.ocrRows && body.ocrRows.length > 0) {
+            const rowsText = body.ocrRows.join('\n');
+            const { supplier, invoiceNumber } = extractInvoiceHeader(rowsText);
+            extracted = {
+              supplier,
+              invoiceNumber,
+              lines: parseOcrRows(body.ocrRows),
+            };
+            reconText = rowsText;
+            if (extracted.lines.length === 0) {
+              throw new Error(
+                'No invoice lines could be read from this photo. Try a closer, well-lit shot of the full invoice, or enter the lines manually.',
+              );
+            }
+          } else {
+            // Real scans must carry OCR text from the browser. A photo with no
+            // readable text is a 422, never the demo invoice: the old
+            // OCR_PROVIDER=sample path returned the fixed Core-Mark sample for
+            // every photo, which is why real invoices "scanned" as sample data.
+            extracted = await provider.extract(body.ocrText ?? body.imageBase64 ?? '');
+          }
         }
       } catch (e) {
         res.status(422).json({
@@ -322,7 +368,22 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
       res.status(201).json({
         ...draft,
         lines,
-        reconciliation: reconcileInvoice(reconText, matched),
+        reconciliation: reconOverride
+          ? {
+              expectedTotalCents: reconOverride.expectedTotalCents,
+              linesTotalCents: matched.reduce((s, l) => s + l.qty * l.unitCostCents, 0),
+              expectedUnits: reconOverride.expectedUnits,
+              linesUnits: matched.reduce((s, l) => s + l.qty, 0),
+              matches:
+                (reconOverride.expectedTotalCents === null ||
+                  Math.abs(
+                    matched.reduce((s, l) => s + l.qty * l.unitCostCents, 0) -
+                      reconOverride.expectedTotalCents,
+                  ) <= 200) &&
+                (reconOverride.expectedUnits === null ||
+                  matched.reduce((s, l) => s + l.qty, 0) === reconOverride.expectedUnits),
+            }
+          : reconcileInvoice(reconText, matched),
       });
     } catch (err) {
       if (err instanceof z.ZodError) {
