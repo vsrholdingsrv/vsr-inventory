@@ -6,6 +6,7 @@ import {
   createDraft,
   InvoiceDraft,
   matchInvoiceLines,
+  reconcileInvoice,
   SampleInvoiceProvider,
   TextOcrProvider,
 } from '../invoice';
@@ -294,7 +295,11 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
            FROM invoice_lines WHERE invoice_scan_id = $1 ORDER BY created_at`,
         [draft.id],
       );
-      res.status(201).json({ ...draft, lines });
+      res.status(201).json({
+        ...draft,
+        lines,
+        reconciliation: reconcileInvoice(body.ocrText ?? '', matched),
+      });
     } catch (err) {
       if (err instanceof z.ZodError) {
         res.status(400).json({ error: 'Invalid scan request', details: err.issues });
@@ -307,6 +312,94 @@ router.post('/manual', async (req: Request, res: Response, next: NextFunction) =
       next(err);
     }
   });
+
+const textSchema = z.object({
+  storeId: z.string().uuid(),
+  text: z.string().min(20).max(20000),
+});
+
+/**
+ * POST /api/invoices/text — create a draft from invoice text the user
+ * pasted (e.g. copied from the photo with iPhone Live Text, which reads
+ * this kind of invoice far better than the in-app OCR). Same parser and
+ * same draft-only flow as a photo scan.
+ */
+router.post('/text', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const body = textSchema.parse(req.body);
+    const store = await pool.query(`SELECT id FROM stores WHERE id = $1`, [body.storeId]);
+    if (store.rows.length === 0) {
+      res.status(404).json({ error: 'Store not found' });
+      return;
+    }
+    let extracted: Awaited<ReturnType<TextOcrProvider['extract']>>;
+    try {
+      extracted = await new TextOcrProvider().extract(body.text);
+    } catch (e) {
+      res.status(422).json({
+        error: e instanceof Error ? e.message : 'Could not read any invoice lines from that text.',
+      });
+      return;
+    }
+    const { rows: catalog } = await pool.query(
+      `SELECT id, name, barcode, cost_cents FROM products`,
+    );
+    const matched = matchInvoiceLines(extracted.lines, catalog);
+    const draft = await withTransaction(async (client) => {
+      const { rows: scans } = await client.query(
+        `INSERT INTO invoice_scans (store_id, supplier, invoice_number, status, raw)
+         VALUES ($1, $2, $3, 'draft', $4) RETURNING id`,
+        [
+          body.storeId,
+          extracted.supplier,
+          extracted.invoiceNumber,
+          JSON.stringify({ ...extracted, source: 'pasted-text' }),
+        ],
+      );
+      const scanId: string = scans[0].id;
+      const draftShape = createDraft({
+        id: scanId,
+        storeId: body.storeId,
+        supplier: extracted.supplier,
+        invoiceNumber: extracted.invoiceNumber,
+        lines: matched,
+      });
+      for (const line of matched) {
+        await client.query(
+          `INSERT INTO invoice_lines
+             (invoice_scan_id, product_id, name, barcode, qty, unit_cost_cents, status, confirmed)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE)`,
+          [
+            scanId,
+            line.productId,
+            line.name,
+            line.barcode ?? null,
+            line.qty,
+            line.unitCostCents,
+            line.status,
+          ],
+        );
+      }
+      return draftShape;
+    });
+    const { rows: lines } = await pool.query(
+      `SELECT id, product_id, name, barcode, qty, unit_cost_cents, status, confirmed
+         FROM invoice_lines WHERE invoice_scan_id = $1 ORDER BY created_at`,
+      [draft.id],
+    );
+    res.status(201).json({
+      ...draft,
+      lines,
+      reconciliation: reconcileInvoice(body.text, matched),
+    });
+  } catch (err) {
+    if (err instanceof z.ZodError) {
+      res.status(400).json({ error: 'Invalid pasted-text request', details: err.issues });
+      return;
+    }
+    next(err);
+  }
+});
 
 const updateLineSchema = z.object({
   qty: z.number().int().min(1).optional(),

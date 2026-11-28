@@ -114,12 +114,21 @@ export interface InvoiceLine {
   confirmed: boolean;
 }
 
+export interface Reconciliation {
+  expectedTotalCents: number | null;
+  linesTotalCents: number;
+  expectedUnits: number | null;
+  linesUnits: number;
+  matches: boolean;
+}
+
 export interface InvoiceDraft {
   id: string;
   supplier: string;
   invoiceNumber?: string;
   lines: InvoiceLine[];
   createdAt: string;
+  reconciliation?: Reconciliation;
 }
 
 export interface OverviewTotals {
@@ -480,6 +489,7 @@ interface InvoiceDraftRow {
   invoice_number?: string;
   status?: string;
   created_at?: string;
+  reconciliation?: Reconciliation;
   lines: {
     id: string;
     name: string;
@@ -511,6 +521,7 @@ function mapInvoiceDraft(row: InvoiceDraftRow): InvoiceDraft {
       confirmed: l.confirmed ?? false,
     })),
     createdAt: row.created_at ?? '',
+    reconciliation: row.reconciliation,
   };
 }
 
@@ -548,6 +559,19 @@ export async function createManualInvoice(
   const row = await request<InvoiceDraftRow>('/api/invoices/manual', {
     method: 'POST',
     body: JSON.stringify({ storeId: sid, supplier, invoiceNumber, lines }),
+  });
+  return mapInvoiceDraft(row);
+}
+
+/** Create a draft from invoice text pasted by the user (e.g. iPhone Live Text). */
+export async function scanInvoiceText(
+  text: string,
+  storeId?: string,
+): Promise<InvoiceDraft> {
+  const sid = await defaultStoreId(storeId);
+  const row = await request<InvoiceDraftRow>('/api/invoices/text', {
+    method: 'POST',
+    body: JSON.stringify({ storeId: sid, text }),
   });
   return mapInvoiceDraft(row);
 }

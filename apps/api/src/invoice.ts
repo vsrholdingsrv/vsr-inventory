@@ -88,9 +88,15 @@ export function parseOcrText(text: string): ExtractedInvoice {
     rawLines.find((l) => /distribution|company/i.test(l) && l.length < 80) ??
     rawLines[0] ??
     'Unknown supplier';
-  const supplier = supplierLine.replace(/\s+/g, ' ').trim();
-  const invoiceMatch = text.match(/invoice[:\s#]*([A-Za-z0-9][A-Za-z0-9-]{3,})/i);
-  const invoiceNumber = invoiceMatch ? invoiceMatch[1] : '';
+  // OCR garbage ("ae Ra JN: 0") is worse than no supplier: only trust a
+  // supplier line that contains a real word (5+ letters).
+  const supplierCandidate = supplierLine.replace(/\s+/g, ' ').trim();
+  const supplier = /[A-Za-z]{5,}/.test(supplierCandidate)
+    ? supplierCandidate
+    : 'Unknown supplier';
+  const invoiceMatch = text.match(/invoice[:\s#]*([A-Za-z0-9][A-Za-z0-9-]{4,})/i);
+  const invoiceNumber =
+    invoiceMatch && /\d{5,}/.test(invoiceMatch[1]) ? invoiceMatch[1] : '';
 
   const SKIP = /^(totals?|discount|invoice|deposit|tax|total due|units picked|number of sku|cases delivered|units delivered|id\s+qty|route:|load sheet|salesman:|cust#|terms:|po#|for billing|your signature|printed signature)/i;
 
@@ -171,6 +177,14 @@ export function parseOcrText(text: string): ExtractedInvoice {
     const barcode =
       inLineBarcode?.[1] ??
       (/^\d{12}$/.test(logical[i + 1] ?? '') ? logical[i + 1] : undefined);
+    // A trusted row must carry an item code (RB1718), a barcode, or a full
+    // distributor money row (price + deposit + discount + sugar + total).
+    // Without any anchor the numbers are unanchored OCR noise — the junk
+    // line in the user's screenshot ("oo HE A Tamme . Ti Sa an LL", qty 8
+    // @ $58.25, only 2 money values) passed every numeric guard and still
+    // was not a real invoice line.
+    const hasCode = /[A-Za-z]{1,4}\d{2,}/.test(head);
+    if (!hasCode && !barcode && moneys.length < 4) continue;
     lines.push({
       name: desc,
       barcode,
@@ -193,6 +207,45 @@ export function parseOcrText(text: string): ExtractedInvoice {
     return true;
   });
   return { supplier, invoiceNumber, lines: deduped };
+}
+
+export interface Reconciliation {
+  expectedTotalCents: number | null;
+  linesTotalCents: number;
+  expectedUnits: number | null;
+  linesUnits: number;
+  matches: boolean;
+}
+
+/**
+ * Cross-check parsed lines against the totals printed on the invoice
+ * itself (INVOICE $399.44, Units Delivered 192). A draft whose lines do
+ * not add up to the printed totals was misread — the user must see that
+ * before confirming anything, not after posting it to the ledger.
+ */
+export function reconcileInvoice(
+  text: string,
+  lines: InvoiceLineInput[],
+): Reconciliation {
+  const totalMatch = text.match(/invoice\s+\$?\s*([\d,]+\.\d{2})/i);
+  const expectedTotalCents = totalMatch
+    ? Math.round(Number(totalMatch[1].replace(/,/g, '')) * 100)
+    : null;
+  const unitsMatch = text.match(/units delivered\s+(\d+)/i);
+  const expectedUnits = unitsMatch ? Number(unitsMatch[1]) : null;
+  const linesTotalCents = lines.reduce((s, l) => s + l.qty * l.unitCostCents, 0);
+  const linesUnits = lines.reduce((s, l) => s + l.qty, 0);
+  const totalOk =
+    expectedTotalCents === null ||
+    Math.abs(linesTotalCents - expectedTotalCents) <= 200;
+  const unitsOk = expectedUnits === null || linesUnits === expectedUnits;
+  return {
+    expectedTotalCents,
+    linesTotalCents,
+    expectedUnits,
+    linesUnits,
+    matches: totalOk && unitsOk,
+  };
 }
 
 function cleanDescription(raw: string): string {

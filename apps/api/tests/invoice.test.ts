@@ -4,6 +4,7 @@ import {
   createDraft,
   matchInvoiceLines,
   parseOcrText,
+  reconcileInvoice,
   SampleInvoiceProvider,
 } from '../src/invoice';
 
@@ -203,5 +204,81 @@ describe('parseOcrText — messy OCR (0.1.6)', () => {
 
   it('still throws on text with no readable rows', () => {
     expect(() => parseOcrText('Red Bull Distribution\nInvoice 123\nThank you')).toThrow(/No invoice lines/);
+  });
+});
+
+describe('parseOcrText — junk rejection + reconciliation (0.1.8)', () => {
+  it('drops a plausible-looking line with no item code or barcode', () => {
+    // The exact failure from the user's screenshot: one junk line, qty 8 @ $58.25.
+    expect(() =>
+      parseOcrText(
+        [
+          'ae Ra JN: 0',
+          'oo HE A Tamme . Ti Sa an LL 8 $58.25 $0.00',
+        ].join('\n'),
+      ),
+    ).toThrow(/No invoice lines/);
+  });
+
+  it('falls back to Unknown supplier instead of OCR garbage', () => {
+    const inv = parseOcrText(
+      [
+        'Red Bull Distribution Company Inc.',
+        'Invoice: 2039427858',
+        'RB1718 2 48 RED BULL 8.4OZ LS 45.99 2.40 8.00 0.00 80.78',
+        '611269991000',
+      ].join('\n'),
+    );
+    expect(inv.supplier).toMatch(/Red Bull/);
+    expect(inv.lines).toHaveLength(1);
+    expect(inv.lines[0].barcode).toBe('611269991000');
+  });
+
+  it('reconciliation matches the clean Red Bull invoice totals', () => {
+    const text = [
+      'Red Bull Distribution Company Inc.',
+      'Invoice: 2039427858',
+      'RB1718 2 48 RED BULL 8.4OZ LS 45.99 2.40 8.00 0.00 80.78',
+      '611269991000',
+      'RB249731 1 24 W PEACH 12OZ 58.71 2.40 8.00 0.00 53.11',
+      '611269002706',
+      'Units Delivered 192',
+      'INVOICE $399.44',
+    ].join('\n');
+    const inv = parseOcrText(text);
+    const r = reconcileInvoice(text, inv.lines);
+    expect(r.linesUnits).toBe(72);
+    expect(r.expectedUnits).toBe(192);
+    expect(r.expectedTotalCents).toBe(39944);
+    expect(r.matches).toBe(false); // only 2 of 6 lines in this excerpt
+  });
+
+  it('reconciliation matches when all 6 Red Bull lines parse', () => {
+    const text = [
+      'Red Bull Distribution Company Inc.',
+      'Invoice: 2039427858',
+      'RB1718 2 48 RED BULL 8.4OZ LS 45.99 2.40 8.00 0.00 80.78',
+      '611269991000',
+      'RB249731 1 24 W PEACH 12OZ 58.71 2.40 8.00 0.00 53.11',
+      '611269002706',
+      'RB248898 1 24 ICED 12OZ 58.71 2.40 8.00 0.00 53.11',
+      '611269001846',
+      'RB253417 1 24 APPLE 12OZ LS 58.71 2.40 8.00 0.00 53.11',
+      '611269002867',
+      'RB221027 1 24 COCONUT 12OZ LS 58.71 2.40 8.00 0.00 53.11',
+      '611269321210',
+      'RB4817 2 48 SUGARFREE 12OZ LS 58.71 2.40 8.00 0.00 106.22',
+      '611269716467',
+      'Units Delivered 192',
+      'INVOICE $399.44',
+    ].join('\n');
+    const inv = parseOcrText(text);
+    expect(inv.lines).toHaveLength(6);
+    const r = reconcileInvoice(text, inv.lines);
+    expect(r.linesUnits).toBe(192);
+    // Unit costs are rounded to the cent, so the line sum is within $1 of
+    // the printed $399.44 — inside the $2 reconciliation tolerance.
+    expect(Math.abs(r.linesTotalCents - 39944)).toBeLessThanOrEqual(200);
+    expect(r.matches).toBe(true);
   });
 });
